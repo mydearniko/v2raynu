@@ -29,6 +29,14 @@ object V2RayNativeManager {
             )
         }.getOrNull()
     }
+    private val setAttemptTimeoutMethod: Method? by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        runCatching {
+            Libv2ray::class.java.getMethod(
+                "setRealPingAttemptTimeoutMillis",
+                java.lang.Long.TYPE
+            )
+        }.getOrNull()
+    }
 
     /**
      * Initialize V2Ray core environment.
@@ -108,8 +116,9 @@ object V2RayNativeManager {
      */
     fun setRealPingAttemptTimeoutMillis(timeoutMillis: Long) {
         try {
-            Libv2ray.setRealPingAttemptTimeoutMillis(timeoutMillis)
-        } catch (e: Exception) {
+            val method = setAttemptTimeoutMethod ?: return
+            method.invoke(null, timeoutMillis)
+        } catch (e: Throwable) {
             Log.e(AppConfig.TAG, "Failed to set real-ping attempt timeout", e)
         }
     }
