@@ -77,11 +77,13 @@
 
                         <TextView
                             android:id="@+id/tv_test_state"
-                            android:layout_width="wrap_content"
+                            android:layout_width="match_parent"
                             android:layout_height="match_parent"
+                            android:ellipsize="end"
                             android:gravity="start|center"
                             android:maxLines="2"
                             android:minLines="1"
+                            android:paddingEnd="@dimen/view_height_dp64"
                             android:paddingStart="@dimen/padding_spacing_dp16"
                             android:text="@string/connection_test_pending"
                             android:textAppearance="@style/TextAppearance.AppCompat.Small" />
@@ -100,7 +102,7 @@
                         android:layout_width="wrap_content"
                         android:layout_height="wrap_content"
                         android:layout_gravity="bottom|end"
-                        android:layout_marginBottom="@dimen/view_height_dp36"
+                        android:layout_marginBottom="@dimen/view_height_dp64"
                         android:clickable="true"
                         android:contentDescription="@string/tasker_start_service"
                         android:focusable="true"

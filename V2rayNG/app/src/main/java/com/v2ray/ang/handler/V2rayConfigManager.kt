@@ -15,8 +15,6 @@ import com.v2ray.ang.dto.V2rayConfig.OutboundBean
 import com.v2ray.ang.dto.V2rayConfig.OutboundBean.OutSettingsBean
 import com.v2ray.ang.dto.V2rayConfig.OutboundBean.StreamSettingsBean
 import com.v2ray.ang.dto.V2rayConfig.RoutingBean.RulesBean
-import com.v2ray.ang.extension.isNotNullEmpty
-import com.v2ray.ang.extension.nullIfBlank
 import com.v2ray.ang.fmt.HttpFmt
 import com.v2ray.ang.fmt.Hysteria2Fmt
 import com.v2ray.ang.fmt.ShadowsocksFmt
@@ -28,10 +26,27 @@ import com.v2ray.ang.fmt.WireguardFmt
 import com.v2ray.ang.util.HttpUtil
 import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.Utils
+import java.util.concurrent.ConcurrentHashMap
 
 object V2rayConfigManager {
     private var initConfigCache: String? = null
     private var initConfigCacheWithTun: String? = null
+    private const val LARGE_RUNTIME_CONFIG_OUTBOUND_THRESHOLD = 128
+    private const val DNS_PRERESOLVE_OUTBOUND_LIMIT = 256
+    private const val DNS_PRERESOLVE_LOOKUP_LIMIT = 16
+    private const val DNS_PRERESOLVE_DISABLE_LOOKUP_OUTBOUND_LIMIT = 1024
+    private const val DNS_CACHE_TTL_MS = 5 * 60 * 1000L
+    private const val DNS_CACHE_MAX_ENTRIES = 4096
+    private val dnsResolveCache = ConcurrentHashMap<String, CachedDnsResult>()
+
+    private fun CharSequence?.isNotNullEmpty(): Boolean = !this.isNullOrBlank()
+
+    private fun String?.nullIfBlank(): String? = this?.takeIf { it.isNotBlank() }
+
+    private data class CachedDnsResult(
+        val ips: List<String>,
+        val cachedAtMillis: Long
+    )
 
     //region get config function
 
@@ -140,10 +155,15 @@ object V2rayConfigManager {
         val result = ConfigResult(false)
 
         val serverList = MmkvManager.decodeServerList()
-        val configList = serverList
+        val subscriptionId = config.policyGroupSubscriptionId.takeIf { !it.isNullOrBlank() }
+        val groupFilter = config.policyGroupFilter.takeIf { !it.isNullOrBlank() }
+        val groupRegex = groupFilter?.let { filter ->
+            runCatching { Regex(filter) }.getOrNull()
+        }
+
+        val configList = serverList.asSequence()
             .mapNotNull { id -> MmkvManager.decodeServerConfig(id) }
             .filter { profile ->
-                val subscriptionId = config.policyGroupSubscriptionId
                 if (subscriptionId.isNullOrBlank()) {
                     true
                 } else {
@@ -151,22 +171,18 @@ object V2rayConfigManager {
                 }
             }
             .filter { profile ->
-                val filter = config.policyGroupFilter
-                if (filter.isNullOrBlank()) {
+                if (groupFilter.isNullOrBlank()) {
                     true
                 } else {
-                    try {
-                        Regex(filter).containsMatchIn(profile.remarks)
-                    } catch (e: Exception) {
-                        profile.remarks.contains(filter)
-                    }
+                    groupRegex?.containsMatchIn(profile.remarks) ?: profile.remarks.contains(groupFilter)
                 }
             }
+            .toList()
 
         val v2rayConfig = getV2rayMultipleConfig(context, config, configList) ?: return result
 
         result.status = true
-        result.content = JsonUtil.toJsonPretty(v2rayConfig) ?: ""
+        result.content = serializeRuntimeConfig(v2rayConfig)
         result.guid = guid
 
         return result
@@ -205,6 +221,7 @@ object V2rayConfigManager {
         getFakeDns(v2rayConfig)
 
         getDns(v2rayConfig)
+        configureVpnDnsRouting(v2rayConfig)
 
         if (MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED) == true) {
             getCustomLocalDns(v2rayConfig)
@@ -220,7 +237,7 @@ object V2rayConfigManager {
         }
 
         result.status = true
-        result.content = JsonUtil.toJsonPretty(v2rayConfig) ?: ""
+        result.content = serializeRuntimeConfig(v2rayConfig)
         result.guid = guid
         return result
     }
@@ -262,6 +279,7 @@ object V2rayConfigManager {
         getFakeDns(v2rayConfig)
 
         getDns(v2rayConfig)
+        configureVpnDnsRouting(v2rayConfig)
 
         getBalance(v2rayConfig, config)
 
@@ -318,7 +336,7 @@ object V2rayConfigManager {
         }
 
         result.status = true
-        result.content = JsonUtil.toJsonPretty(v2rayConfig) ?: ""
+        result.content = serializeRuntimeConfig(v2rayConfig, preferCompact = true)
         result.guid = guid
         return result
     }
@@ -350,6 +368,15 @@ object V2rayConfigManager {
         }
         val config = JsonUtil.fromJson(assets, V2rayConfig::class.java)
         return config
+    }
+
+    private fun serializeRuntimeConfig(v2rayConfig: V2rayConfig, preferCompact: Boolean = false): String {
+        val useCompact = preferCompact || v2rayConfig.outbounds.size >= LARGE_RUNTIME_CONFIG_OUTBOUND_THRESHOLD
+        return if (useCompact) {
+            JsonUtil.toJsonCoreSafe(v2rayConfig) ?: ""
+        } else {
+            JsonUtil.toJsonPretty(v2rayConfig) ?: ""
+        }
     }
 
 
@@ -524,45 +551,48 @@ object V2rayConfigManager {
                     )
                 )
             }
-
-            if(SettingsManager.isVpnMode()) {
-                if (SettingsManager.isUsingHevTun()) {
-                    //hev-socks5-tunnel dns routing
-                    v2rayConfig.routing.rules.add(
-                        0, RulesBean(
-                            inboundTag = arrayListOf("socks"),
-                            outboundTag = "dns-out",
-                            port = "53",
-                        )
-                    )
-                } else {
-                    v2rayConfig.routing.rules.add(
-                        0, RulesBean(
-                            inboundTag = arrayListOf("tun"),
-                            outboundTag = "dns-out",
-                            port = "53",
-                        )
-                    )
-                }
-            }
-
-            // DNS outbound
-            if (v2rayConfig.outbounds.none { e -> e.protocol == "dns" && e.tag == "dns-out" }) {
-                v2rayConfig.outbounds.add(
-                    OutboundBean(
-                        protocol = "dns",
-                        tag = "dns-out",
-                        settings = null,
-                        streamSettings = null,
-                        mux = null
-                    )
-                )
-            }
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to configure custom local DNS", e)
             return false
         }
         return true
+    }
+
+    /**
+     * Ensures DNS packets from VPN apps are routed to a stable path.
+     *
+     * - With local DNS enabled: route :53 to dns-out.
+     * - With local DNS disabled: route :53 directly to avoid UDP loss on proxy-only paths.
+     */
+    private fun configureVpnDnsRouting(v2rayConfig: V2rayConfig) {
+        if (!SettingsManager.isVpnMode()) {
+            return
+        }
+
+        val localDnsEnabled = MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED)
+        val inboundTag = if (SettingsManager.isUsingHevTun()) "socks" else "tun"
+        val outboundTag = if (localDnsEnabled) "dns-out" else AppConfig.TAG_DIRECT
+
+        v2rayConfig.routing.rules.add(
+            0,
+            RulesBean(
+                inboundTag = arrayListOf(inboundTag),
+                outboundTag = outboundTag,
+                port = "53",
+            )
+        )
+
+        if (localDnsEnabled && v2rayConfig.outbounds.none { it.protocol == "dns" && it.tag == "dns-out" }) {
+            v2rayConfig.outbounds.add(
+                OutboundBean(
+                    protocol = "dns",
+                    tag = "dns-out",
+                    settings = null,
+                    streamSettings = null,
+                    mux = null
+                )
+            )
+        }
     }
 
     /**
@@ -577,17 +607,20 @@ object V2rayConfigManager {
         try {
             val hosts = mutableMapOf<String, Any>()
             val servers = ArrayList<Any>()
+            val localDnsEnabled = MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED)
+            val preferReliableDnsTransport = localDnsEnabled
 
             //remote Dns
             val remoteDns = SettingsManager.getRemoteDnsServers()
+            val remoteDnsAddresses = remoteDns.map { toReliableDnsAddress(it, preferReliableDnsTransport) }
             val proxyDomain = getUserRule2Domain(AppConfig.TAG_PROXY)
-            remoteDns.forEach {
+            remoteDnsAddresses.forEach {
                 servers.add(it)
             }
             if (proxyDomain.isNotEmpty()) {
                 servers.add(
                     V2rayConfig.DnsBean.ServersBean(
-                        address = remoteDns.first(),
+                        address = remoteDnsAddresses.first(),
                         domains = proxyDomain,
                     )
                 )
@@ -595,13 +628,14 @@ object V2rayConfigManager {
 
             // domestic DNS
             val domesticDns = SettingsManager.getDomesticDnsServers()
+            val domesticDnsAddresses = domesticDns.map { toReliableDnsAddress(it, preferReliableDnsTransport) }
             val directDomain = getUserRule2Domain(AppConfig.TAG_DIRECT)
             val isCnRoutingMode = directDomain.contains(AppConfig.GEOSITE_CN)
             val geoipCn = arrayListOf(AppConfig.GEOIP_CN)
             if (directDomain.isNotEmpty()) {
                 servers.add(
                     V2rayConfig.DnsBean.ServersBean(
-                        address = domesticDns.first(),
+                        address = domesticDnsAddresses.first(),
                         domains = directDomain,
                         expectIPs = if (isCnRoutingMode) geoipCn else null,
                         skipFallback = true,
@@ -633,11 +667,24 @@ object V2rayConfigManager {
             try {
                 val userHosts = MmkvManager.decodeSettingsString(AppConfig.PREF_DNS_HOSTS)
                 if (userHosts.isNotNullEmpty()) {
-                    var userHostsMap = userHosts?.split(",")
-                        ?.filter { it.isNotEmpty() }
-                        ?.filter { it.contains(":") }
-                        ?.associate { it.split(":").let { (k, v) -> k to v } }
-                    if (userHostsMap != null) hosts.putAll(userHostsMap)
+                    val userHostsMap = userHosts.orEmpty()
+                        .split(',', '\n', ';')
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() && it.contains(":") }
+                        .mapNotNull { entry ->
+                            val parts = entry.split(":", limit = 2)
+                            if (parts.size != 2) {
+                                return@mapNotNull null
+                            }
+                            val key = parts[0].trim()
+                            val value = parts[1].trim()
+                            if (key.isEmpty() || value.isEmpty()) {
+                                return@mapNotNull null
+                            }
+                            key to value
+                        }
+                        .toMap()
+                    hosts.putAll(userHostsMap)
                 }
             } catch (e: Exception) {
                 Log.e(AppConfig.TAG, "Failed to configure user DNS hosts", e)
@@ -670,6 +717,17 @@ object V2rayConfigManager {
             return false
         }
         return true
+    }
+
+    /**
+     * Prefer TCP DNS transport for plain IP resolvers to avoid UDP-only DNS failures
+     * on proxy paths where UDP is unavailable or unstable.
+     */
+    private fun toReliableDnsAddress(address: String, preferTcp: Boolean): String {
+        if (!preferTcp || !Utils.isPureIpAddress(address)) {
+            return address
+        }
+        return "tcp://$address"
     }
 
 
@@ -1022,28 +1080,33 @@ object V2rayConfigManager {
         val dns = v2rayConfig.dns ?: return
         val newHosts = dns.hosts?.toMutableMap() ?: mutableMapOf()
         val preferIpv6 = MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6) == true
+        val lookupBudget = when {
+            // Large policy groups can contain thousands of outbounds. Synchronous DNS
+            // pre-resolve here would block service startup for several seconds.
+            proxyOutboundList.size > DNS_PRERESOLVE_DISABLE_LOOKUP_OUTBOUND_LIMIT -> 0
+            proxyOutboundList.size > DNS_PRERESOLVE_OUTBOUND_LIMIT -> DNS_PRERESOLVE_LOOKUP_LIMIT
+            else -> Int.MAX_VALUE
+        }
+        var lookupCount = 0
 
         for (item in proxyOutboundList) {
             val domain = item.getServerAddress()
             if (domain.isNullOrEmpty()) continue
 
             if (newHosts.containsKey(domain)) {
-                item.ensureSockopt().domainStrategy = "UseIP"
-                item.ensureSockopt().happyEyeballs = StreamSettingsBean.HappyEyeballsBean(
-                    prioritizeIPv6 = preferIpv6,
-                    interleave = 2
-                )
+                applyHostResolutionStrategy(item, preferIpv6)
                 continue
             }
 
-            val resolvedIps = HttpUtil.resolveHostToIP(domain, preferIpv6)
-            if (resolvedIps.isNullOrEmpty()) continue
+            if (lookupCount >= lookupBudget) {
+                continue
+            }
 
-            item.ensureSockopt().domainStrategy = "UseIP"
-            item.ensureSockopt().happyEyeballs = StreamSettingsBean.HappyEyeballsBean(
-                prioritizeIPv6 = preferIpv6,
-                interleave = 2
-            )
+            val resolvedIps = resolveHostWithCache(domain, preferIpv6)
+            if (resolvedIps.isNullOrEmpty()) continue
+            lookupCount++
+
+            applyHostResolutionStrategy(item, preferIpv6)
             newHosts[domain] = if (resolvedIps.size == 1) {
                 resolvedIps[0]
             } else {
@@ -1052,6 +1115,35 @@ object V2rayConfigManager {
         }
 
         dns.hosts = newHosts
+    }
+
+    private fun applyHostResolutionStrategy(item: OutboundBean, preferIpv6: Boolean) {
+        item.ensureSockopt().domainStrategy = "UseIP"
+        item.ensureSockopt().happyEyeballs = StreamSettingsBean.HappyEyeballsBean(
+            prioritizeIPv6 = preferIpv6,
+            interleave = 2
+        )
+    }
+
+    private fun resolveHostWithCache(domain: String, preferIpv6: Boolean): List<String>? {
+        val now = System.currentTimeMillis()
+        val cacheKey = if (preferIpv6) "6:$domain" else "4:$domain"
+        val cached = dnsResolveCache[cacheKey]
+        if (cached != null && now - cached.cachedAtMillis <= DNS_CACHE_TTL_MS) {
+            return cached.ips
+        }
+
+        val resolvedIps = HttpUtil.resolveHostToIP(domain, preferIpv6)
+        if (resolvedIps.isNullOrEmpty()) {
+            dnsResolveCache.remove(cacheKey)
+            return null
+        }
+
+        if (dnsResolveCache.size > DNS_CACHE_MAX_ENTRIES) {
+            dnsResolveCache.clear()
+        }
+        dnsResolveCache[cacheKey] = CachedDnsResult(resolvedIps, now)
+        return resolvedIps
     }
 
     /**

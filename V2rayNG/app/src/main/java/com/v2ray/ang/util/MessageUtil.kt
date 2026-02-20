@@ -46,6 +46,9 @@ object MessageUtil {
             intent.component = ComponentName(ctx, V2RayTestService::class.java)
             intent.putExtra("key", what)
             intent.putExtra("content", content)
+            if (content is Long) {
+                intent.putExtra("content_batch_id", content)
+            }
             ctx.startService(intent)
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to send message to test service", e)

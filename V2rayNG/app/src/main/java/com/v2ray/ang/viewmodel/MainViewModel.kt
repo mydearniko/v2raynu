@@ -15,6 +15,7 @@ import com.v2ray.ang.AngApplication
 import com.v2ray.ang.AppConfig
 import com.v2ray.ang.R
 import com.v2ray.ang.dto.GroupMapItem
+import com.v2ray.ang.dto.RealPingResult
 import com.v2ray.ang.dto.ServersCache
 import com.v2ray.ang.dto.SubscriptionCache
 import com.v2ray.ang.extension.serializable
@@ -24,6 +25,7 @@ import com.v2ray.ang.handler.AngConfigManager
 import com.v2ray.ang.handler.MmkvManager
 import com.v2ray.ang.handler.SettingsManager
 import com.v2ray.ang.handler.SpeedtestManager
+import com.v2ray.ang.service.RealPingBatchStore
 import com.v2ray.ang.util.MessageUtil
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
@@ -233,16 +235,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun testAllRealPing() {
         MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG_CANCEL, "")
-        MmkvManager.clearAllTestDelayResults(serversCache.map { it.guid }.toList())
         updateListAction.value = -1
 
-        val serversCopy = serversCache.toList()
+        val guids = ArrayList<String>(serversCache.map { it.guid })
+        if (guids.isEmpty()) {
+            return
+        }
+
         viewModelScope.launch(Dispatchers.Default) {
-            val guids = ArrayList<String>(serversCopy.map { it.guid })
-            if (guids.isEmpty()) {
-                return@launch
-            }
-            MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG, guids)
+            MmkvManager.clearAllTestDelayResults(guids)
+            val batchId = RealPingBatchStore.createBatch(guids)
+            MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG, batchId)
         }
     }
 
@@ -267,28 +270,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Gets the subscriptions.
-     * @param context The context.
-     * @return A pair of lists containing the subscription IDs and remarks.
+     * @return The list of subscription groups.
      */
-    fun getSubscriptions(context: Context): List<GroupMapItem> {
+    fun getSubscriptions(): List<GroupMapItem> {
         val subscriptions = MmkvManager.decodeSubscriptions()
-        if (subscriptionId.isNotEmpty()
-            && !subscriptions.map { it.guid }.contains(subscriptionId)
-        ) {
-            subscriptionIdChanged("")
+        val subscriptionIds = subscriptions.map { it.guid }
+
+        if (subscriptions.isEmpty()) {
+            if (subscriptionId.isNotEmpty()) {
+                subscriptionId = ""
+                MmkvManager.encodeSettings(AppConfig.CACHE_SUBSCRIPTION_ID, subscriptionId)
+                reloadServerList()
+            }
+            return emptyList()
         }
 
-        val groups = mutableListOf<GroupMapItem>()
-        groups.add(
-            GroupMapItem(
-                id = "",
-                remarks = context.getString(R.string.filter_config_all)
-            )
-        )
-        subscriptions.forEach { sub ->
-            groups.add(GroupMapItem(id = sub.guid, remarks = sub.subscription.remarks))
+        if (!subscriptionIds.contains(subscriptionId)) {
+            subscriptionId = subscriptionIds.first()
+            MmkvManager.encodeSettings(AppConfig.CACHE_SUBSCRIPTION_ID, subscriptionId)
+            reloadServerList()
         }
-        return groups
+
+        return subscriptions.map { sub ->
+            GroupMapItem(id = sub.guid, remarks = sub.subscription.remarks)
+        }
     }
 
     /**
@@ -368,20 +373,76 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Sorts servers by their test results.
      */
     fun sortByTestResults() {
-        data class ServerDelay(var guid: String, var testDelayMillis: Long)
+        data class ServerScore(
+            val guid: String,
+            val successCount: Int,
+            val averageLatencyMillis: Long,
+            val worstLatencyMillis: Long,
+            val jitterMillis: Long,
+            val originalIndex: Int
+        )
 
-        val serverDelays = mutableListOf<ServerDelay>()
+        val serverScores = mutableListOf<ServerScore>()
         val serverList = MmkvManager.decodeServerList()
-        serverList.forEach { key ->
-            val delay = MmkvManager.decodeServerAffiliationInfo(key)?.testDelayMillis ?: 0L
-            serverDelays.add(ServerDelay(key, if (delay <= 0L) 999999 else delay))
-        }
-        serverDelays.sortBy { it.testDelayMillis }
+        serverList.forEachIndexed { index, key ->
+            val aff = MmkvManager.decodeServerAffiliationInfo(key)
+            val samples = aff?.testDelaySamples.orEmpty()
+            val successCount = if (samples.isNotEmpty()) {
+                samples.count { it >= 0L }
+            } else if ((aff?.testDelayMillis ?: 0L) > 0L) {
+                1
+            } else {
+                0
+            }
 
-        serverDelays.forEach {
-            serverList.remove(it.guid)
-            serverList.add(it.guid)
+            val validSamples = when {
+                samples.isNotEmpty() -> samples.filter { it >= 0L }
+                (aff?.testDelayMillis ?: 0L) > 0L -> listOf(aff?.testDelayMillis ?: Long.MAX_VALUE)
+                else -> emptyList()
+            }
+
+            val averageLatencyMillis = if (validSamples.isEmpty()) {
+                Long.MAX_VALUE
+            } else {
+                validSamples.sum().toDouble().div(validSamples.size).toLong()
+            }
+
+            val worstLatencyMillis = if (validSamples.isEmpty()) {
+                Long.MAX_VALUE
+            } else {
+                validSamples.maxOrNull() ?: Long.MAX_VALUE
+            }
+
+            val jitterMillis = if (validSamples.size <= 1) {
+                0L
+            } else {
+                (validSamples.maxOrNull() ?: 0L) - (validSamples.minOrNull() ?: 0L)
+            }
+
+            serverScores.add(
+                ServerScore(
+                    guid = key,
+                    successCount = successCount,
+                    averageLatencyMillis = averageLatencyMillis,
+                    worstLatencyMillis = worstLatencyMillis,
+                    jitterMillis = jitterMillis,
+                    originalIndex = index
+                )
+            )
         }
+
+        val sortedServerGuids = serverScores
+            .sortedWith(
+                compareByDescending<ServerScore> { it.successCount }
+                    .thenBy { it.averageLatencyMillis }
+                    .thenBy { it.worstLatencyMillis }
+                    .thenBy { it.jitterMillis }
+                    .thenBy { it.originalIndex }
+            )
+            .map { it.guid }
+
+        serverList.clear()
+        serverList.addAll(sortedServerGuids)
 
         MmkvManager.encodeServerList(serverList)
     }
@@ -455,15 +516,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 AppConfig.MSG_MEASURE_CONFIG_SUCCESS -> {
-                    val resultPair = intent.serializable<Pair<String, Long>>("content") ?: return
-                    MmkvManager.encodeServerTestDelayMillis(resultPair.first, resultPair.second)
-                    updateListAction.value = getPosition(resultPair.first)
+                    val result = intent.serializable<RealPingResult>("content") ?: return
+                    MmkvManager.encodeServerTestDelaySamples(result.guid, result.samples)
+                    updateListAction.value = getPosition(result.guid)
                 }
 
                 AppConfig.MSG_MEASURE_CONFIG_NOTIFY -> {
                     val content = intent.getStringExtra("content")
-                    updateTestResultAction.value =
-                        getApplication<AngApplication>().getString(R.string.connection_runing_task_left, content)
+                    updateTestResultAction.value = content
                 }
 
                 AppConfig.MSG_MEASURE_CONFIG_FINISH -> {

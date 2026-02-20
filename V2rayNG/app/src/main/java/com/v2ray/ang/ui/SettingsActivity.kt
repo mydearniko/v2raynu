@@ -16,6 +16,7 @@ import com.v2ray.ang.R
 import com.v2ray.ang.extension.toLongEx
 import com.v2ray.ang.handler.MmkvManager
 import com.v2ray.ang.helper.MmkvPreferenceDataStore
+import com.v2ray.ang.handler.SettingsManager
 import com.v2ray.ang.handler.SubscriptionUpdater
 import com.v2ray.ang.util.Utils
 import java.util.concurrent.TimeUnit
@@ -50,6 +51,8 @@ class SettingsActivity : BaseActivity() {
 
         private val autoUpdateCheck by lazy { findPreference<CheckBoxPreference>(AppConfig.SUBSCRIPTION_AUTO_UPDATE) }
         private val autoUpdateInterval by lazy { findPreference<EditTextPreference>(AppConfig.SUBSCRIPTION_AUTO_UPDATE_INTERVAL) }
+        private val realPingThreads by lazy { findPreference<EditTextPreference>(AppConfig.PREF_REAL_PING_THREADS) }
+        private val realPingTimeout by lazy { findPreference<EditTextPreference>(AppConfig.PREF_REAL_PING_TIMEOUT) }
         private val mode by lazy { findPreference<ListPreference>(AppConfig.PREF_MODE) }
 
         private val hevTunLogLevel by lazy { findPreference<ListPreference>(AppConfig.PREF_HEV_TUNNEL_LOGLEVEL) }
@@ -112,6 +115,16 @@ class SettingsActivity : BaseActivity() {
                 updateHevTunSettings(newValue as Boolean)
                 true
             }
+
+            realPingThreads?.setOnPreferenceChangeListener { _, newValue ->
+                updateRealPingThreads(newValue as? String)
+                true
+            }
+
+            realPingTimeout?.setOnPreferenceChangeListener { _, newValue ->
+                updateRealPingTimeout(newValue as? String)
+                true
+            }
         }
 
         private fun initPreferenceSummaries() {
@@ -167,6 +180,10 @@ class SettingsActivity : BaseActivity() {
 
             // Initialize auto-update interval state
             autoUpdateInterval?.isEnabled = MmkvManager.decodeSettingsBool(AppConfig.SUBSCRIPTION_AUTO_UPDATE, false)
+
+            // Initialize real-ping thread summary state
+            updateRealPingThreads(MmkvManager.decodeSettingsString(AppConfig.PREF_REAL_PING_THREADS))
+            updateRealPingTimeout(MmkvManager.decodeSettingsString(AppConfig.PREF_REAL_PING_TIMEOUT))
         }
 
         private fun updateMode(value: String?) {
@@ -261,6 +278,20 @@ class SettingsActivity : BaseActivity() {
         private fun updateHevTunSettings(enabled: Boolean) {
             hevTunLogLevel?.isEnabled = enabled
             hevTunRwTimeout?.isEnabled = enabled
+        }
+
+        private fun updateRealPingThreads(value: String?) {
+            val defaultThreads = SettingsManager.getDefaultRealPingThreadCount()
+            val configuredThreads = value?.toIntOrNull() ?: defaultThreads
+            val normalized = configuredThreads.coerceIn(1, 2048)
+            realPingThreads?.summary = normalized.toString()
+        }
+
+        private fun updateRealPingTimeout(value: String?) {
+            val defaultTimeout = SettingsManager.getDefaultRealPingAttemptTimeoutMillis()
+            val configuredTimeout = value?.toIntOrNull() ?: defaultTimeout
+            val normalized = configuredTimeout.coerceIn(500, 30000)
+            realPingTimeout?.summary = normalized.toString()
         }
     }
 

@@ -29,6 +29,12 @@ import java.util.Collections
 import java.util.Locale
 
 object SettingsManager {
+    private const val REAL_PING_THREAD_MIN = 1
+    private const val REAL_PING_THREAD_MAX = 2048
+    private const val REAL_PING_THREAD_FACTOR = 4
+    private const val REAL_PING_TIMEOUT_MIN_MS = 500
+    private const val REAL_PING_TIMEOUT_MAX_MS = 30000
+    private const val REAL_PING_TIMEOUT_DEFAULT_MS = 3000
 
     /**
      * Initialize routing rulesets.
@@ -280,9 +286,9 @@ object SettingsManager {
      * @return A list of domestic DNS servers.
      */
     fun getDomesticDnsServers(): List<String> {
-        val domesticDns =
-            MmkvManager.decodeSettingsString(AppConfig.PREF_DOMESTIC_DNS) ?: AppConfig.DNS_DIRECT
-        val ret = domesticDns.split(",").filter { Utils.isPureIpAddress(it) || Utils.isCoreDNSAddress(it) }
+        val domesticDns = MmkvManager.decodeSettingsString(AppConfig.PREF_DOMESTIC_DNS) ?: AppConfig.DNS_DIRECT
+        val ret = parseDnsEntries(domesticDns)
+            .filter { Utils.isPureIpAddress(it) || Utils.isCoreDNSAddress(it) }
         if (ret.isEmpty()) {
             return listOf(AppConfig.DNS_DIRECT)
         }
@@ -294,9 +300,9 @@ object SettingsManager {
      * @return A list of remote DNS servers.
      */
     fun getRemoteDnsServers(): List<String> {
-        val remoteDns =
-            MmkvManager.decodeSettingsString(AppConfig.PREF_REMOTE_DNS) ?: AppConfig.DNS_PROXY
-        val ret = remoteDns.split(",").filter { Utils.isPureIpAddress(it) || Utils.isCoreDNSAddress(it) }
+        val remoteDns = MmkvManager.decodeSettingsString(AppConfig.PREF_REMOTE_DNS) ?: AppConfig.DNS_PROXY
+        val ret = parseDnsEntries(remoteDns)
+            .filter { Utils.isPureIpAddress(it) || Utils.isCoreDNSAddress(it) }
         if (ret.isEmpty()) {
             return listOf(AppConfig.DNS_PROXY)
         }
@@ -309,7 +315,23 @@ object SettingsManager {
      */
     fun getVpnDnsServers(): List<String> {
         val vpnDns = MmkvManager.decodeSettingsString(AppConfig.PREF_VPN_DNS) ?: AppConfig.DNS_VPN
-        return vpnDns.split(",").filter { Utils.isPureIpAddress(it) }
+        val ret = parseDnsEntries(vpnDns)
+            .filter { Utils.isPureIpAddress(it) }
+        if (ret.isEmpty()) {
+            return listOf(AppConfig.DNS_VPN)
+        }
+        return ret
+    }
+
+    /**
+     * Parse DNS entries from comma/newline/semicolon separated text.
+     */
+    private fun parseDnsEntries(raw: String): List<String> {
+        return raw
+            .split(',', '\n', ';')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
     }
 
     /**
@@ -324,6 +346,39 @@ object SettingsManager {
             MmkvManager.decodeSettingsString(AppConfig.PREF_DELAY_TEST_URL)
                 ?: AppConfig.DELAY_TEST_URL
         }
+    }
+
+    /**
+     * Returns the default real-ping worker thread count for this device.
+     */
+    fun getDefaultRealPingThreadCount(): Int {
+        return (Runtime.getRuntime().availableProcessors().coerceAtLeast(1) * REAL_PING_THREAD_FACTOR)
+            .coerceIn(REAL_PING_THREAD_MIN, REAL_PING_THREAD_MAX)
+    }
+
+    /**
+     * Returns real-ping worker thread count from settings with clamped bounds.
+     */
+    fun getRealPingThreadCount(): Int {
+        val configured = MmkvManager.decodeSettingsString(AppConfig.PREF_REAL_PING_THREADS)?.toIntOrNull()
+        return (configured ?: getDefaultRealPingThreadCount())
+            .coerceIn(REAL_PING_THREAD_MIN, REAL_PING_THREAD_MAX)
+    }
+
+    /**
+     * Returns default real-ping timeout per attempt in milliseconds.
+     */
+    fun getDefaultRealPingAttemptTimeoutMillis(): Int {
+        return REAL_PING_TIMEOUT_DEFAULT_MS
+    }
+
+    /**
+     * Returns real-ping timeout per attempt in milliseconds with clamped bounds.
+     */
+    fun getRealPingAttemptTimeoutMillis(): Int {
+        val configured = MmkvManager.decodeSettingsString(AppConfig.PREF_REAL_PING_TIMEOUT)?.toIntOrNull()
+        return (configured ?: getDefaultRealPingAttemptTimeoutMillis())
+            .coerceIn(REAL_PING_TIMEOUT_MIN_MS, REAL_PING_TIMEOUT_MAX_MS)
     }
 
     /**
@@ -410,6 +465,8 @@ object SettingsManager {
         ensureDefaultValue(AppConfig.PREF_REMOTE_DNS, AppConfig.DNS_PROXY)
         ensureDefaultValue(AppConfig.PREF_DOMESTIC_DNS, AppConfig.DNS_DIRECT)
         ensureDefaultValue(AppConfig.PREF_DELAY_TEST_URL, AppConfig.DELAY_TEST_URL)
+        ensureDefaultValue(AppConfig.PREF_REAL_PING_THREADS, getDefaultRealPingThreadCount().toString())
+        ensureDefaultValue(AppConfig.PREF_REAL_PING_TIMEOUT, getDefaultRealPingAttemptTimeoutMillis().toString())
         ensureDefaultValue(AppConfig.PREF_IP_API_URL, AppConfig.IP_API_URL)
         ensureDefaultValue(AppConfig.PREF_HEV_TUNNEL_RW_TIMEOUT, AppConfig.HEVTUN_RW_TIMEOUT)
         ensureDefaultValue(AppConfig.PREF_MUX_CONCURRENCY, "8")

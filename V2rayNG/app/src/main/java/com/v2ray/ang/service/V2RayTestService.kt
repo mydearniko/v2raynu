@@ -9,12 +9,14 @@ import com.v2ray.ang.AppConfig.MSG_MEASURE_CONFIG_CANCEL
 import com.v2ray.ang.extension.serializable
 import com.v2ray.ang.handler.V2RayNativeManager
 import com.v2ray.ang.util.MessageUtil
-import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 class V2RayTestService : Service() {
 
-    // manage active batch workers so each batch is independent and cancellable
-    private val activeWorkers = Collections.synchronizedList(mutableListOf<RealPingWorkerService>())
+    // Each start request creates a new generation. Older generations are treated as stale and ignored.
+    private val batchGeneration = AtomicLong(0L)
+    private val activeWorkers = ConcurrentHashMap<Long, RealPingWorkerService>()
 
     /**
      * Initializes the V2Ray environment.
@@ -38,10 +40,9 @@ class V2RayTestService : Service() {
      */
     override fun onDestroy() {
         super.onDestroy()
-        // cancel any active workers
-        val snapshot = ArrayList(activeWorkers)
-        snapshot.forEach { it.cancel() }
-        activeWorkers.clear()
+        batchGeneration.incrementAndGet()
+        cancelAllWorkers()
+        RealPingBatchStore.clear()
     }
 
     /**
@@ -54,26 +55,49 @@ class V2RayTestService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.getIntExtra("key", 0)) {
             MSG_MEASURE_CONFIG -> {
-                val guidsList = intent.serializable<ArrayList<String>>("content")
-                if (guidsList != null && guidsList.isNotEmpty()) {
-                    lateinit var worker: RealPingWorkerService
-                    worker = RealPingWorkerService(this, guidsList) { status ->
-                        // notify UI and remove the worker from active list when finished
-                        MessageUtil.sendMsg2UI(this@V2RayTestService, AppConfig.MSG_MEASURE_CONFIG_FINISH, status)
-                        activeWorkers.remove(worker)
+                val guidsList = resolveGuids(intent)
+                if (guidsList.isNullOrEmpty()) {
+                    MessageUtil.sendMsg2UI(this@V2RayTestService, AppConfig.MSG_MEASURE_CONFIG_FINISH, "-1")
+                } else {
+                    val batchId = batchGeneration.incrementAndGet()
+                    cancelAllWorkers()
+
+                    val worker = RealPingWorkerService(
+                        context = this,
+                        guids = guidsList,
+                        shouldRun = { batchGeneration.get() == batchId }
+                    ) { status ->
+                        activeWorkers.remove(batchId)
+                        if (batchGeneration.get() == batchId) {
+                            MessageUtil.sendMsg2UI(this@V2RayTestService, AppConfig.MSG_MEASURE_CONFIG_FINISH, status)
+                        }
                     }
-                    activeWorkers.add(worker)
+                    activeWorkers[batchId] = worker
                     worker.start()
                 }
             }
 
             MSG_MEASURE_CONFIG_CANCEL -> {
-                // cancel all running batch workers independently
-                val snapshot = ArrayList(activeWorkers)
-                snapshot.forEach { it.cancel() }
-                activeWorkers.clear()
+                batchGeneration.incrementAndGet()
+                cancelAllWorkers()
+                RealPingBatchStore.clear()
             }
         }
         return super.onStartCommand(intent, flags, startId)
+    }
+
+    private fun resolveGuids(intent: Intent): ArrayList<String>? {
+        val batchId = intent.getLongExtra("content_batch_id", -1L).takeIf { it > 0L }
+            ?: intent.serializable<Long>("content")
+        if (batchId != null) {
+            return RealPingBatchStore.takeBatch(batchId)
+        }
+        return intent.serializable<ArrayList<String>>("content")
+    }
+
+    private fun cancelAllWorkers() {
+        val snapshot = activeWorkers.values.toList()
+        activeWorkers.clear()
+        snapshot.forEach { it.cancel() }
     }
 }

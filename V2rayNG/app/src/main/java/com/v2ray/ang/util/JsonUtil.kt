@@ -6,14 +6,28 @@ import com.google.gson.GsonBuilder
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import com.google.gson.JsonPrimitive
-import com.google.gson.JsonSerializationContext
 import com.google.gson.JsonSerializer
 import com.google.gson.reflect.TypeToken
 import com.v2ray.ang.AppConfig
-import java.lang.reflect.Type
 
 object JsonUtil {
-    private var gson = Gson()
+    private val gson = Gson()
+    private val coreDoubleSerializer = JsonSerializer<Double> { src, _, _ ->
+        JsonPrimitive(src?.toInt())
+    }
+    private val coreSafeCompactGson by lazy {
+        GsonBuilder()
+            .disableHtmlEscaping()
+            .registerTypeAdapter(object : TypeToken<Double>() {}.type, coreDoubleSerializer)
+            .create()
+    }
+    private val coreSafePrettyGson by lazy {
+        GsonBuilder()
+            .setPrettyPrinting()
+            .disableHtmlEscaping()
+            .registerTypeAdapter(object : TypeToken<Double>() {}.type, coreDoubleSerializer)
+            .create()
+    }
 
     /**
      * Converts an object to its JSON representation.
@@ -23,6 +37,16 @@ object JsonUtil {
      */
     fun toJson(src: Any?): String {
         return gson.toJson(src)
+    }
+
+    /**
+     * Converts an object to compact JSON with numeric serialization compatible with core parsing.
+     */
+    fun toJsonCoreSafe(src: Any?): String? {
+        if (src == null) {
+            return null
+        }
+        return coreSafeCompactGson.toJson(src)
     }
 
     /**
@@ -43,21 +67,10 @@ object JsonUtil {
      * @return The pretty-printed JSON representation of the object, or null if the object is null.
      */
     fun toJsonPretty(src: Any?): String? {
-        if (src == null)
+        if (src == null) {
             return null
-        val gsonPre = GsonBuilder()
-            .setPrettyPrinting()
-            .disableHtmlEscaping()
-            .registerTypeAdapter( // custom serializer is needed here since JSON by default parse number as Double, core will fail to start
-                object : TypeToken<Double>() {}.type,
-                JsonSerializer { src: Double?, _: Type?, _: JsonSerializationContext? ->
-                    JsonPrimitive(
-                        src?.toInt()
-                    )
-                }
-            )
-            .create()
-        return gsonPre.toJson(src)
+        }
+        return coreSafePrettyGson.toJson(src)
     }
 
     /**

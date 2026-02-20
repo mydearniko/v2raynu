@@ -2,6 +2,9 @@ package com.v2ray.ang.ui
 
 import android.annotation.SuppressLint
 import android.graphics.Color
+import android.text.Spannable
+import android.text.SpannableStringBuilder
+import android.text.style.ForegroundColorSpan
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -62,11 +65,21 @@ class MainRecyclerAdapter(
 
             //TestResult
             val aff = MmkvManager.decodeServerAffiliationInfo(guid)
-            holder.itemMainBinding.tvTestResult.text = aff?.getTestDelayString().orEmpty()
-            if ((aff?.testDelayMillis ?: 0L) < 0L) {
-                holder.itemMainBinding.tvTestResult.setTextColor(ContextCompat.getColor(context, R.color.colorPingRed))
-            } else {
+            val samples = aff?.getSortedTestDelaySamples().orEmpty()
+            if (samples.isNotEmpty()) {
                 holder.itemMainBinding.tvTestResult.setTextColor(ContextCompat.getColor(context, R.color.colorPing))
+                holder.itemMainBinding.tvTestResult.text = buildColoredDelaySamples(
+                    samples = samples,
+                    successColor = ContextCompat.getColor(context, R.color.colorPing),
+                    failureColor = ContextCompat.getColor(context, R.color.colorPingRed)
+                )
+            } else {
+                holder.itemMainBinding.tvTestResult.text = aff?.getTestDelayString().orEmpty()
+                if ((aff?.testDelayMillis ?: 0L) < 0L) {
+                    holder.itemMainBinding.tvTestResult.setTextColor(ContextCompat.getColor(context, R.color.colorPingRed))
+                } else {
+                    holder.itemMainBinding.tvTestResult.setTextColor(ContextCompat.getColor(context, R.color.colorPing))
+                }
             }
 
             //layoutIndicator
@@ -138,6 +151,29 @@ class MainRecyclerAdapter(
             else
                 null
         return subRemarks?.toString() ?: ""
+    }
+
+    private fun buildColoredDelaySamples(
+        samples: List<Long>,
+        successColor: Int,
+        failureColor: Int
+    ): Spannable {
+        val builder = SpannableStringBuilder()
+        samples.forEachIndexed { index, sample ->
+            if (index > 0) {
+                builder.append(" / ")
+            }
+            val start = builder.length
+            builder.append("${sample}ms")
+            val end = builder.length
+            builder.setSpan(
+                ForegroundColorSpan(if (sample >= 0L) successColor else failureColor),
+                start,
+                end,
+                Spannable.SPAN_EXCLUSIVE_EXCLUSIVE
+            )
+        }
+        return builder
     }
 
     fun removeServerSub(guid: String, position: Int) {

@@ -209,6 +209,38 @@ object MmkvManager {
         }
         val aff = decodeServerAffiliationInfo(guid) ?: ServerAffiliationInfo()
         aff.testDelayMillis = testResult
+        aff.testDelaySamples = mutableListOf(testResult)
+        serverAffStorage.encode(guid, JsonUtil.toJson(aff))
+    }
+
+    /**
+     * Encodes multiple server test delay samples and stores a representative delay
+     * for sorting/invalid checks.
+     *
+     * @param guid The server GUID.
+     * @param testResults The measured delay samples in milliseconds.
+     */
+    fun encodeServerTestDelaySamples(guid: String, testResults: LongArray) {
+        if (guid.isBlank()) {
+            return
+        }
+
+        val aff = decodeServerAffiliationInfo(guid) ?: ServerAffiliationInfo()
+        aff.testDelaySamples = testResults
+            .toList()
+            .sortedWith { a, b ->
+                when {
+                    a < 0L && b < 0L -> 0
+                    a < 0L -> 1
+                    b < 0L -> -1
+                    else -> a.compareTo(b)
+                }
+            }
+            .toMutableList()
+
+        val valid = aff.testDelaySamples.filter { it >= 0L }.sorted()
+        // Treat less than 2 successful samples as unstable to reduce false positives.
+        aff.testDelayMillis = if (valid.size >= 2) valid[valid.size / 2] else -1L
         serverAffStorage.encode(guid, JsonUtil.toJson(aff))
     }
 
@@ -219,9 +251,9 @@ object MmkvManager {
      */
     fun clearAllTestDelayResults(keys: List<String>?) {
         keys?.forEach { key ->
-            decodeServerAffiliationInfo(key)?.let { aff ->
-                aff.testDelayMillis = 0
-                serverAffStorage.encode(key, JsonUtil.toJson(aff))
+            if (key.isNotBlank()) {
+                // Affiliation currently stores delay-only fields, so key removal is the fastest clear path.
+                serverAffStorage.remove(key)
             }
         }
     }

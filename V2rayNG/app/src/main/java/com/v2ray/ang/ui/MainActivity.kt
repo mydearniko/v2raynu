@@ -114,10 +114,15 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
     }
 
     private fun setupGroupTab() {
-        val groups = mainViewModel.getSubscriptions(this)
+        val groups = mainViewModel.getSubscriptions()
         groupPagerAdapter.update(groups)
 
         tabMediator?.detach()
+        if (groups.isEmpty()) {
+            binding.tabGroup.isVisible = false
+            return
+        }
+
         tabMediator = TabLayoutMediator(binding.tabGroup, binding.viewPager) { tab, position ->
             groupPagerAdapter.groups.getOrNull(position)?.let {
                 tab.text = it.remarks
@@ -125,7 +130,7 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
             }
         }.also { it.attach() }
 
-        val targetIndex = groups.indexOfFirst { it.id == mainViewModel.subscriptionId }.takeIf { it >= 0 } ?: (groups.size - 1)
+        val targetIndex = groups.indexOfFirst { it.id == mainViewModel.subscriptionId }.takeIf { it >= 0 } ?: 0
         binding.viewPager.setCurrentItem(targetIndex, false)
 
         binding.tabGroup.isVisible = groups.size > 1

@@ -8,6 +8,18 @@
             android:summary="@string/summary_pref_speed_enabled"
             android:title="@string/title_pref_speed_enabled" />
 
+        <EditTextPreference
+            android:inputType="number"
+            android:key="pref_real_ping_threads"
+            android:summary="32"
+            android:title="@string/title_pref_real_ping_threads" />
+
+        <EditTextPreference
+            android:inputType="number"
+            android:key="pref_real_ping_timeout"
+            android:summary="3000"
+            android:title="@string/title_pref_real_ping_timeout" />
+
         <CheckBoxPreference
             android:key="pref_confirm_remove"
             android:summary="@string/summary_pref_confirm_remove"

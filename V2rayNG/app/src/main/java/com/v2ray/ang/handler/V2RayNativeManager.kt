@@ -8,6 +8,7 @@ import go.Seq
 import libv2ray.CoreCallbackHandler
 import libv2ray.CoreController
 import libv2ray.Libv2ray
+import java.lang.reflect.Method
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -18,6 +19,16 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 object V2RayNativeManager {
     private val initialized = AtomicBoolean(false)
+    private val measureSeriesMethod: Method? by lazy(LazyThreadSafetyMode.PUBLICATION) {
+        runCatching {
+            Libv2ray::class.java.getMethod(
+                "measureOutboundDelaySeries",
+                String::class.java,
+                String::class.java,
+                java.lang.Long.TYPE
+            )
+        }.getOrNull()
+    }
 
     /**
      * Initialize V2Ray core environment.
@@ -72,6 +83,57 @@ object V2RayNativeManager {
             Log.e(AppConfig.TAG, "Failed to measure outbound delay", e)
             -1L
         }
+    }
+
+    /**
+     * Measure multiple outbound delay samples in one native session.
+     * Returns null when native batch measurement is unavailable or malformed.
+     */
+    fun measureOutboundDelaySeries(config: String, testUrl: String, samples: Int): LongArray? {
+        if (samples <= 0) {
+            return LongArray(0)
+        }
+        return try {
+            val method = measureSeriesMethod ?: return null
+            val payload = method.invoke(null, config, testUrl, samples.toLong()) as? String
+            parseDelaySeries(payload, samples)
+        } catch (e: Throwable) {
+            Log.e(AppConfig.TAG, "Failed to measure outbound delay series", e)
+            null
+        }
+    }
+
+    /**
+     * Configure real-ping attempt timeout in milliseconds.
+     */
+    fun setRealPingAttemptTimeoutMillis(timeoutMillis: Long) {
+        try {
+            Libv2ray.setRealPingAttemptTimeoutMillis(timeoutMillis)
+        } catch (e: Exception) {
+            Log.e(AppConfig.TAG, "Failed to set real-ping attempt timeout", e)
+        }
+    }
+
+    private fun parseDelaySeries(payload: String?, expectedSamples: Int): LongArray? {
+        if (payload.isNullOrBlank()) {
+            return null
+        }
+        val parts = payload.split(',')
+        if (parts.isEmpty()) {
+            return null
+        }
+
+        val parsed = parts.mapNotNull { it.trim().toLongOrNull() }
+        if (parsed.isEmpty()) {
+            return null
+        }
+
+        val ret = LongArray(expectedSamples) { -1L }
+        val limit = minOf(expectedSamples, parsed.size)
+        for (index in 0 until limit) {
+            ret[index] = parsed[index]
+        }
+        return ret
     }
 
     /**
