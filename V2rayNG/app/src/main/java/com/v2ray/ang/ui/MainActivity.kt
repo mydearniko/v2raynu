@@ -154,12 +154,8 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
     }
 
     private fun handleLayoutTestClick() {
-        if (mainViewModel.isRunning.value == true) {
-            setTestState(getString(R.string.connection_test_testing))
-            mainViewModel.testCurrentServerRealPing()
-        } else {
-            // service not running: keep existing no-op (could show a message if desired)
-        }
+        setTestState(getString(R.string.connection_test_testing))
+        mainViewModel.testCurrentServerRealPing()
     }
 
     private fun startV2Ray() {

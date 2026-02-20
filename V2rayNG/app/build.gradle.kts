@@ -1,37 +1,97 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     id("com.jaredsburrows.license")
 }
 
+val versionPropsFile = rootProject.file("version.properties")
+val signingPropsFile = rootProject.file("signing.properties")
+
+fun loadVersionProps(): Properties {
+    val props = Properties()
+    if (versionPropsFile.exists()) {
+        versionPropsFile.inputStream().use { props.load(it) }
+    } else {
+        props.setProperty("VERSION_NAME", "2.0.9")
+        props.setProperty("VERSION_CODE", "709")
+        versionPropsFile.outputStream().use { props.store(it, "Project version") }
+    }
+    return props
+}
+
+fun bumpPatchVersionIfBuildTaskRequested() {
+    val shouldBump = gradle.startParameter.taskNames.any {
+        val taskName = it.lowercase()
+        taskName.contains("assemble") || taskName.contains("bundle")
+    }
+    if (!shouldBump) return
+
+    val props = loadVersionProps()
+    val currentVersionName = props.getProperty("VERSION_NAME") ?: error("Missing VERSION_NAME")
+    val match = Regex("""2\.0\.(\d+)""").matchEntire(currentVersionName)
+        ?: error("VERSION_NAME must stay in 2.0.x format. Current: $currentVersionName")
+
+    val currentVersionCode = props.getProperty("VERSION_CODE")?.toIntOrNull()
+        ?: error("VERSION_CODE must be an integer.")
+    val nextVersionName = "2.0.${match.groupValues[1].toInt() + 1}"
+    val nextVersionCode = currentVersionCode + 1
+
+    props.setProperty("VERSION_NAME", nextVersionName)
+    props.setProperty("VERSION_CODE", nextVersionCode.toString())
+    versionPropsFile.outputStream().use { props.store(it, "Auto-updated during build") }
+    logger.lifecycle("Auto version bump: $currentVersionName ($currentVersionCode) -> $nextVersionName ($nextVersionCode)")
+}
+
+bumpPatchVersionIfBuildTaskRequested()
+val appVersionProps = loadVersionProps()
+val appVersionCode = appVersionProps.getProperty("VERSION_CODE").toInt()
+val appVersionName = appVersionProps.getProperty("VERSION_NAME")
+val signingProps = Properties().apply {
+    if (!signingPropsFile.exists()) {
+        error("Missing signing.properties at ${signingPropsFile.path}.")
+    }
+    signingPropsFile.inputStream().use { load(it) }
+}
+
 android {
     namespace = "com.v2ray.ang"
     compileSdk = 36
+
+    signingConfigs {
+        create("release") {
+            storeFile = rootProject.file(signingProps.getProperty("STORE_FILE"))
+            storePassword = signingProps.getProperty("STORE_PASSWORD")
+            keyAlias = signingProps.getProperty("KEY_ALIAS")
+            keyPassword = signingProps.getProperty("KEY_PASSWORD")
+        }
+    }
 
     defaultConfig {
         applicationId = "com.v2ray.ang"
         minSdk = 24
         targetSdk = 36
-        versionCode = 709
-        versionName = "2.0.9"
+        versionCode = appVersionCode
+        versionName = appVersionName
         multiDexEnabled = true
 
-        val abiFilterList = (properties["ABI_FILTERS"] as? String)?.split(';')
+        val abiFilterList = (properties["ABI_FILTERS"] as? String)
+            ?.split(';', ',')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() }
+            .orEmpty()
+
         splits {
             abi {
                 isEnable = true
                 reset()
-                if (abiFilterList != null && abiFilterList.isNotEmpty()) {
+                if (abiFilterList.isNotEmpty()) {
                     include(*abiFilterList.toTypedArray())
                 } else {
-                    include(
-                        "arm64-v8a",
-                        "armeabi-v7a",
-                        "x86_64",
-                        "x86"
-                    )
+                    include("arm64-v8a")
                 }
-                isUniversalApk = abiFilterList.isNullOrEmpty()
+                isUniversalApk = false
             }
         }
 
@@ -40,6 +100,7 @@ android {
 
     buildTypes {
         release {
+            signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
