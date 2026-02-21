@@ -20,16 +20,22 @@ import com.v2ray.ang.util.MessageUtil
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import libv2ray.CoreCallbackHandler
 import libv2ray.CoreController
 import java.lang.ref.SoftReference
+import java.util.concurrent.atomic.AtomicLong
 
 object V2RayServiceManager {
 
     private val coreController: CoreController = V2RayNativeManager.newCoreController(CoreCallback())
     private val mMsgReceive = ReceiveMessageHandler()
     private var currentConfig: ProfileItem? = null
+    private val delayMeasureGeneration = AtomicLong(0L)
+    @Volatile
+    private var delayMeasureJob: Job? = null
 
     var serviceControl: SoftReference<ServiceControl>? = null
         set(value) {
@@ -183,6 +189,7 @@ object V2RayServiceManager {
      */
     fun stopCoreLoop(): Boolean {
         val service = getService() ?: return false
+        cancelDelayMeasure()
 
         if (coreController.isRunning) {
             CoroutineScope(Dispatchers.IO).launch {
@@ -220,16 +227,21 @@ object V2RayServiceManager {
      * Measures the connection delay for the current V2Ray configuration.
      * Tests with primary URL first, then falls back to alternative URL if needed.
      * Also fetches remote IP information if the delay test was successful.
+     *
+     * New requests cancel previous in-flight requests; stale results are dropped.
      */
     private fun measureV2rayDelay() {
         if (coreController.isRunning == false) {
             return
         }
 
-        CoroutineScope(Dispatchers.IO).launch {
+        val generation = delayMeasureGeneration.incrementAndGet()
+        delayMeasureJob?.cancel()
+        delayMeasureJob = CoroutineScope(Dispatchers.IO).launch {
             val service = getService() ?: return@launch
             var time = -1L
             var errorStr = ""
+            var details: String? = null
 
             try {
                 time = coreController.measureDelay(SettingsManager.getDelayTestUrl())
@@ -237,6 +249,7 @@ object V2RayServiceManager {
                 Log.e(AppConfig.TAG, "Failed to measure delay with primary URL", e)
                 errorStr = e.message?.substringAfter("\":") ?: "empty message"
             }
+            if (!isActive || generation != delayMeasureGeneration.get()) return@launch
             if (time == -1L) {
                 try {
                     time = coreController.measureDelay(SettingsManager.getDelayTestUrl(true))
@@ -245,21 +258,37 @@ object V2RayServiceManager {
                     errorStr = e.message?.substringAfter("\":") ?: "empty message"
                 }
             }
+            if (!isActive || generation != delayMeasureGeneration.get()) return@launch
 
             val result = if (time >= 0) {
                 service.getString(R.string.connection_test_available, time)
             } else {
                 service.getString(R.string.connection_test_error, errorStr)
             }
-            MessageUtil.sendMsg2UI(service, AppConfig.MSG_MEASURE_DELAY_SUCCESS, result)
 
-            // Only fetch IP info if the delay test was successful
+            // Only fetch IP/Geo details if the delay test was successful
             if (time >= 0) {
-                SpeedtestManager.getRemoteIPInfo()?.let { ip ->
-                    MessageUtil.sendMsg2UI(service, AppConfig.MSG_MEASURE_DELAY_SUCCESS, "$result\n$ip")
+                try {
+                    details = SpeedtestManager.getRemoteIpAndGeoInfoSummary()
+                } catch (e: Exception) {
+                    Log.e(AppConfig.TAG, "Failed to fetch remote IP/Geo details", e)
                 }
             }
+            if (!isActive || generation != delayMeasureGeneration.get()) return@launch
+
+            val content = if (details.isNullOrBlank()) result else "$result\n$details"
+            MessageUtil.sendMsg2UI(service, AppConfig.MSG_MEASURE_DELAY_SUCCESS, content)
+
+            if (generation == delayMeasureGeneration.get()) {
+                delayMeasureJob = null
+            }
         }
+    }
+
+    private fun cancelDelayMeasure() {
+        delayMeasureGeneration.incrementAndGet()
+        delayMeasureJob?.cancel()
+        delayMeasureJob = null
     }
 
     /**
@@ -353,6 +382,10 @@ object V2RayServiceManager {
 
                 AppConfig.MSG_MEASURE_DELAY -> {
                     measureV2rayDelay()
+                }
+
+                AppConfig.MSG_MEASURE_DELAY_CANCEL -> {
+                    cancelDelayMeasure()
                 }
             }
 

@@ -70,6 +70,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         delayCheckTimeoutJob = null
     }
 
+    private fun updateRunningState(running: Boolean) {
+        if (isRunning.value != running) {
+            isRunning.value = running
+        }
+    }
+
+    private fun cancelRunningTests() {
+        tcpingTestScope.coroutineContext[Job]?.cancelChildren()
+        SpeedtestManager.closeAllTcpSockets()
+        MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_MEASURE_DELAY_CANCEL, "")
+        MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG_CANCEL, "")
+    }
+
     /**
      * Refer to the official documentation for [registerReceiver](https://developer.android.com/reference/androidx/core/content/ContextCompat#registerReceiver(android.content.Context,android.content.BroadcastReceiver,android.content.IntentFilter,int):
      * `registerReceiver(Context, BroadcastReceiver, IntentFilter, int)`.
@@ -86,8 +99,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     override fun onCleared() {
         getApplication<AngApplication>().unregisterReceiver(mMsgReceiver)
-        tcpingTestScope.coroutineContext[Job]?.cancelChildren()
-        SpeedtestManager.closeAllTcpSockets()
+        cancelRunningTests()
         Log.i(AppConfig.TAG, "Main ViewModel is cleared")
         super.onCleared()
     }
@@ -275,8 +287,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Tests the real ping for the current server.
      */
     fun testCurrentServerRealPing() {
-        if (isDelayCheckPending) return
-
+        cancelRunningTests()
         isDelayCheckPending = true
         MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_REGISTER_CLIENT, "")
         requestDelayCheck()
@@ -286,6 +297,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             delay(12000L)
             if (!isDelayCheckPending) return@launch
 
+            MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_MEASURE_DELAY_CANCEL, "")
             clearDelayCheckPending()
             updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_test_fail)
         }
@@ -525,12 +537,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         override fun onReceive(ctx: Context?, intent: Intent?) {
             when (intent?.getIntExtra("key", 0)) {
                 AppConfig.MSG_STATE_RUNNING -> {
-                    isRunning.value = true
+                    updateRunningState(true)
                     retryDelayCheckIfNeeded()
                 }
 
                 AppConfig.MSG_STATE_NOT_RUNNING -> {
-                    isRunning.value = false
+                    updateRunningState(false)
                     if (isDelayCheckPending) {
                         clearDelayCheckPending()
                         updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_not_connected)
@@ -539,13 +551,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
                 AppConfig.MSG_STATE_START_SUCCESS -> {
                     getApplication<AngApplication>().toastSuccess(R.string.toast_services_success)
-                    isRunning.value = true
+                    updateRunningState(true)
                     retryDelayCheckIfNeeded()
                 }
 
                 AppConfig.MSG_STATE_START_FAILURE -> {
                     getApplication<AngApplication>().toastError(R.string.toast_services_failure)
-                    isRunning.value = false
+                    updateRunningState(false)
                     if (isDelayCheckPending) {
                         clearDelayCheckPending()
                         updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_not_connected)
@@ -553,7 +565,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 AppConfig.MSG_STATE_STOP_SUCCESS -> {
-                    isRunning.value = false
+                    updateRunningState(false)
                     if (isDelayCheckPending) {
                         clearDelayCheckPending()
                         updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_not_connected)

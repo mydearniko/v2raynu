@@ -8,6 +8,7 @@ import com.v2ray.ang.R
 import com.v2ray.ang.dto.IPAPIInfo
 import com.v2ray.ang.util.HttpUtil
 import com.v2ray.ang.util.JsonUtil
+import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import java.io.IOException
@@ -126,7 +127,7 @@ object SpeedtestManager {
 
         val httpPort = SettingsManager.getHttpPort()
         val content = HttpUtil.getUrlContent(url, 5000, httpPort) ?: return null
-        val ipInfo = JsonUtil.fromJson(content, IPAPIInfo::class.java) ?: return null
+        val ipInfo = parseIpApiInfo(content) ?: return null
 
         val ip = listOf(
             ipInfo.ip,
@@ -143,5 +144,118 @@ object SpeedtestManager {
         ).firstOrNull { !it.isNullOrBlank() }
 
         return "(${country ?: "unknown"}) ${ip ?: "unknown"}"
+    }
+
+    /**
+     * Performs multi-source IP lookups and then resolves each discovered IP with:
+     * https://i.idanya.ru/who/$IP
+     *
+     * Returns a short two-line summary suitable for UI display.
+     */
+    fun getRemoteIpAndGeoInfoSummary(): String? {
+        val httpPort = SettingsManager.getHttpPort()
+        val checks = listOf(
+            "A" to SettingsManager.getIpCheckUrlA(),
+            "B" to SettingsManager.getIpCheckUrlB()
+        )
+
+        val lines = mutableListOf<String>()
+        checks.forEach { (label, url) ->
+            try {
+                val rawIpBody = HttpUtil.getUrlContent(url, 5000, httpPort)
+                val ip = extractFirstIp(rawIpBody)
+                if (ip == null) {
+                    lines.add("IP $label: unavailable")
+                    return@forEach
+                }
+
+                val whoUrl = "https://i.idanya.ru/who/${Utils.urlEncode(ip)}"
+                val whoBody = HttpUtil.getUrlContent(whoUrl, 7000, httpPort)
+                val whoSummary = summarizeGeoBody(whoBody)
+                lines.add("IP $label: ${whoSummary ?: ip}")
+            } catch (e: Exception) {
+                Log.w(AppConfig.TAG, "IP/Geo check failed for source $label", e)
+                lines.add("IP $label: unavailable")
+            }
+        }
+
+        return lines.takeIf { it.isNotEmpty() }?.joinToString("\n")
+    }
+
+    private fun extractFirstIp(body: String?): String? {
+        if (body.isNullOrBlank()) return null
+
+        val trimmed = body.trim()
+        if (Utils.isPureIpAddress(trimmed)) {
+            return trimmed
+        }
+
+        val candidateRegex = Regex("[0-9A-Fa-f:.]+")
+        return candidateRegex.findAll(trimmed)
+            .map { it.value.trim('[', ']', '(', ')', '{', '}', '<', '>', ',', ';', '"', '\'') }
+            .firstOrNull { token -> token.isNotEmpty() && Utils.isPureIpAddress(token) }
+    }
+
+    private fun summarizeGeoBody(body: String?): String? {
+        if (body.isNullOrBlank()) return null
+        val trimmed = stripAnsi(body).trim()
+
+        parseIpApiInfo(trimmed)?.let { info ->
+            val country = listOf(
+                info.country_name,
+                info.country,
+                info.country_code,
+                info.countryCode,
+                info.location?.country_code
+            ).firstOrNull { !it.isNullOrBlank() }
+            val ip = listOf(
+                info.ip,
+                info.clientIp,
+                info.ip_addr,
+                info.query
+            ).firstOrNull { !it.isNullOrBlank() }
+            if (!country.isNullOrBlank() || !ip.isNullOrBlank()) {
+                return listOf(country, ip)
+                    .filter { !it.isNullOrBlank() }
+                    .joinToString(" ")
+                    .take(120)
+            }
+        }
+
+        JsonUtil.parseString(trimmed)?.let { json ->
+            val country = json.get("country")?.takeIf { !it.isJsonNull }?.asString
+            val region = json.get("region")?.takeIf { !it.isJsonNull }?.asString
+            val city = json.get("city")?.takeIf { !it.isJsonNull }?.asString
+            val ip = json.get("query")?.takeIf { !it.isJsonNull }?.asString
+            val summary = listOf(country, region, city, ip)
+                .filter { !it.isNullOrBlank() }
+                .joinToString(" ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+            if (summary.isNotEmpty()) {
+                return summary.take(120)
+            }
+        }
+
+        return trimmed
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+            ?.replace(Regex("<[^>]+>"), " ")
+            ?.replace(Regex("\\s+"), " ")
+            ?.take(120)
+    }
+
+    private fun stripAnsi(value: String): String {
+        return value.replace(Regex("\u001B\\[[;\\d]*m"), "")
+    }
+
+    private fun parseIpApiInfo(content: String): IPAPIInfo? {
+        return try {
+            JsonUtil.fromJson(content, IPAPIInfo::class.java)
+        } catch (e: Exception) {
+            Log.w(AppConfig.TAG, "Failed to parse IP API response as JSON", e)
+            null
+        }
     }
 }

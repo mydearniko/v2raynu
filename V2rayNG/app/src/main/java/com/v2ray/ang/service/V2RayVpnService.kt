@@ -29,7 +29,7 @@ import com.v2ray.ang.util.Utils
 import java.lang.ref.SoftReference
 
 class V2RayVpnService : VpnService(), ServiceControl {
-    private lateinit var mInterface: ParcelFileDescriptor
+    private var mInterface: ParcelFileDescriptor? = null
     private var isRunning = false
     private var tun2SocksService: Tun2SocksControl? = null
 
@@ -92,7 +92,9 @@ class V2RayVpnService : VpnService(), ServiceControl {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        setupVpnService()
+        if (!setupVpnService()) {
+            return START_NOT_STICKY
+        }
         startService()
         return START_STICKY
         //return super.onStartCommand(intent, flags, startId)
@@ -103,11 +105,13 @@ class V2RayVpnService : VpnService(), ServiceControl {
     }
 
     override fun startService() {
-        if (mInterface == null) {
+        val vpnInterface = mInterface
+        if (vpnInterface == null) {
             Log.e(AppConfig.TAG, "Failed to create VPN interface")
+            stopAllService()
             return
         }
-        if (!V2RayServiceManager.startCoreLoop(mInterface)) {
+        if (!V2RayServiceManager.startCoreLoop(vpnInterface)) {
             Log.e(AppConfig.TAG, "Failed to start V2Ray core loop")
             stopAllService()
             return
@@ -133,21 +137,22 @@ class V2RayVpnService : VpnService(), ServiceControl {
      * Sets up the VPN service.
      * Prepares the VPN and configures it if preparation is successful.
      */
-    private fun setupVpnService() {
+    private fun setupVpnService(): Boolean {
         val prepare = prepare(this)
         if (prepare != null) {
             Log.e(AppConfig.TAG, "VPN preparation failed")
             stopSelf()
-            return
+            return false
         }
 
         if (configureVpnService() != true) {
             Log.e(AppConfig.TAG, "VPN configuration failed")
             stopSelf()
-            return
+            return false
         }
 
         runTun2socks()
+        return true
     }
 
     /**
@@ -165,7 +170,7 @@ class V2RayVpnService : VpnService(), ServiceControl {
 
         // Close the old interface since the parameters have been changed
         try {
-            mInterface.close()
+            mInterface?.close()
         } catch (ignored: Exception) {
             // ignored
         }
@@ -175,7 +180,11 @@ class V2RayVpnService : VpnService(), ServiceControl {
 
         // Create a new interface using the builder and save the parameters
         try {
-            mInterface = builder.establish()!!
+            mInterface = builder.establish()
+            if (mInterface == null) {
+                Log.e(AppConfig.TAG, "VPN interface establish returned null")
+                return false
+            }
             isRunning = true
             return true
         } catch (e: Exception) {
@@ -307,10 +316,12 @@ class V2RayVpnService : VpnService(), ServiceControl {
      * Starts the tun2socks process with the appropriate parameters.
      */
     private fun runTun2socks() {
+        val vpnInterface = mInterface ?: return
+
         if (SettingsManager.isUsingHevTun()) {
             tun2SocksService = TProxyService(
                 context = applicationContext,
-                vpnInterface = mInterface,
+                vpnInterface = vpnInterface,
                 isRunningProvider = { isRunning },
                 restartCallback = { runTun2socks() }
             )
@@ -349,11 +360,11 @@ class V2RayVpnService : VpnService(), ServiceControl {
             stopSelf()
 
             try {
-                mInterface.close()
+                mInterface?.close()
+                mInterface = null
             } catch (e: Exception) {
                 Log.e(AppConfig.TAG, "Failed to close VPN interface", e)
             }
         }
     }
 }
-

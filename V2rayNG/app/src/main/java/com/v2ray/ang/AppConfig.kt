@@ -61,6 +61,9 @@ object AppConfig {
     const val PREF_REAL_PING_THREADS = "pref_real_ping_threads"
     const val PREF_REAL_PING_TIMEOUT = "pref_real_ping_timeout"
     const val PREF_IP_API_URL = "pref_ip_api_url"
+    const val PREF_IP_CHECK_A_URL = "pref_ip_check_a_url"
+    const val PREF_IP_CHECK_B_URL = "pref_ip_check_b_url"
+    const val PREF_GEOIP_CHECK_URL = "pref_geoip_check_url"
     const val PREF_LOGLEVEL = "pref_core_loglevel"
     const val PREF_OUTBOUND_DOMAIN_RESOLVE_METHOD = "pref_outbound_domain_resolve_method"
     const val PREF_MODE = "pref_mode"
@@ -121,6 +124,9 @@ object AppConfig {
     const val DELAY_TEST_URL2 = "https://www.google.com/generate_204"
 //    const val IP_API_URL = "https://speed.cloudflare.com/meta"
     const val IP_API_URL = "https://api.ip.sb/geoip"
+    const val IP_CHECK_A_URL = "https://icanhazip.com"
+    const val IP_CHECK_B_URL = "https://internet-lab.ru/ip"
+    const val GEOIP_CHECK_URL = "https://i.idanya.ru/who/\$IP"
 
     /** DNS server addresses. */
     const val DNS_PROXY = "1.1.1.1"
@@ -152,6 +158,7 @@ object AppConfig {
     const val MSG_STATE_RESTART = 5
     const val MSG_MEASURE_DELAY = 6
     const val MSG_MEASURE_DELAY_SUCCESS = 61
+    const val MSG_MEASURE_DELAY_CANCEL = 62
     const val MSG_MEASURE_CONFIG = 7
     const val MSG_MEASURE_CONFIG_SUCCESS = 71
     const val MSG_MEASURE_CONFIG_CANCEL = 72

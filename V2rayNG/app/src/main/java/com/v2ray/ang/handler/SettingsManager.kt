@@ -349,6 +349,45 @@ object SettingsManager {
     }
 
     /**
+     * Get IP check URL A.
+     */
+    fun getIpCheckUrlA(): String {
+        return MmkvManager.decodeSettingsString(AppConfig.PREF_IP_CHECK_A_URL)
+            ?: AppConfig.IP_CHECK_A_URL
+    }
+
+    /**
+     * Get IP check URL B.
+     */
+    fun getIpCheckUrlB(): String {
+        return MmkvManager.decodeSettingsString(AppConfig.PREF_IP_CHECK_B_URL)
+            ?: AppConfig.IP_CHECK_B_URL
+    }
+
+    /**
+     * Get GeoIP check URL template.
+     *
+     * Supports "$IP" placeholder.
+     */
+    fun getGeoIpCheckUrlTemplate(): String {
+        return MmkvManager.decodeSettingsString(AppConfig.PREF_GEOIP_CHECK_URL)
+            ?: AppConfig.GEOIP_CHECK_URL
+    }
+
+    /**
+     * Build GeoIP URL from template and IP.
+     */
+    fun buildGeoIpCheckUrl(ip: String): String {
+        val template = getGeoIpCheckUrlTemplate()
+        val encodedIp = Utils.urlEncode(ip)
+        return if (template.contains("\$IP")) {
+            template.replace("\$IP", encodedIp)
+        } else {
+            template + encodedIp
+        }
+    }
+
+    /**
      * Returns the default real-ping worker thread count for this device.
      */
     fun getDefaultRealPingThreadCount(): Int {
@@ -468,6 +507,9 @@ object SettingsManager {
         ensureDefaultValue(AppConfig.PREF_REAL_PING_THREADS, getDefaultRealPingThreadCount().toString())
         ensureDefaultValue(AppConfig.PREF_REAL_PING_TIMEOUT, getDefaultRealPingAttemptTimeoutMillis().toString())
         ensureDefaultValue(AppConfig.PREF_IP_API_URL, AppConfig.IP_API_URL)
+        ensureDefaultValue(AppConfig.PREF_IP_CHECK_A_URL, AppConfig.IP_CHECK_A_URL)
+        ensureDefaultValue(AppConfig.PREF_IP_CHECK_B_URL, AppConfig.IP_CHECK_B_URL)
+        ensureDefaultValue(AppConfig.PREF_GEOIP_CHECK_URL, AppConfig.GEOIP_CHECK_URL)
         ensureDefaultValue(AppConfig.PREF_HEV_TUNNEL_RW_TIMEOUT, AppConfig.HEVTUN_RW_TIMEOUT)
         ensureDefaultValue(AppConfig.PREF_MUX_CONCURRENCY, "8")
         ensureDefaultValue(AppConfig.PREF_MUX_XUDP_CONCURRENCY, "8")

@@ -2,6 +2,28 @@
 <PreferenceScreen xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:app="http://schemas.android.com/apk/res-auto">
 
+    <PreferenceCategory android:title="@string/title_connection_test_settings">
+        <EditTextPreference
+            android:key="pref_delay_test_url"
+            android:summary="@string/summary_pref_delay_test_url"
+            android:title="@string/title_pref_delay_test_url" />
+
+        <EditTextPreference
+            android:key="pref_ip_check_a_url"
+            android:summary="@string/summary_pref_ip_check_a_url"
+            android:title="@string/title_pref_ip_check_a_url" />
+
+        <EditTextPreference
+            android:key="pref_ip_check_b_url"
+            android:summary="@string/summary_pref_ip_check_b_url"
+            android:title="@string/title_pref_ip_check_b_url" />
+
+        <EditTextPreference
+            android:key="pref_geoip_check_url"
+            android:summary="@string/summary_pref_geoip_check_url"
+            android:title="@string/title_pref_geoip_check_url" />
+    </PreferenceCategory>
+
     <PreferenceCategory android:title="@string/title_ui_settings">
         <CheckBoxPreference
             android:key="pref_speed_enabled"
@@ -284,16 +306,6 @@
             android:defaultValue="false"
             android:summary="@string/summary_pref_auto_sort_after_test"
             android:title="@string/title_pref_auto_sort_after_test" />
-
-        <EditTextPreference
-            android:key="pref_delay_test_url"
-            android:summary="@string/summary_pref_delay_test_url"
-            android:title="@string/title_pref_delay_test_url" />
-
-        <EditTextPreference
-            android:key="pref_ip_api_url"
-            android:summary="@string/summary_pref_ip_api_url"
-            android:title="@string/title_pref_ip_api_url" />
 
         <ListPreference
             android:defaultValue="VPN"
