@@ -61,10 +61,10 @@
                             android:textAppearance="@style/TextAppearance.AppCompat.Subhead" />
 
                         <LinearLayout
-                            android:layout_width="wrap_content"
+                            android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:orientation="horizontal"
-                            android:paddingTop="@dimen/padding_spacing_dp8">
+                            android:paddingTop="@dimen/padding_spacing_dp4">
 
                             <androidx.constraintlayout.widget.ConstraintLayout
                                 android:id="@+id/layout_subscription"
@@ -88,10 +88,14 @@
 
                             <TextView
                                 android:id="@+id/tv_statistics"
-                                android:layout_width="wrap_content"
+                                android:layout_width="0dp"
                                 android:layout_height="wrap_content"
-                                android:lines="1"
-                                android:textAppearance="@style/TextAppearance.AppCompat.Small" />
+                                android:layout_weight="1"
+                                android:ellipsize="end"
+                                android:maxLines="3"
+                                android:minLines="1"
+                                android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                                tools:text="185.120.14.20:443\nSNI: edge.example.com" />
 
                         </LinearLayout>
 
@@ -190,7 +194,7 @@
                 android:layout_height="wrap_content"
                 android:orientation="horizontal"
                 android:paddingStart="@dimen/padding_spacing_dp8"
-                android:paddingTop="@dimen/padding_spacing_dp8"
+                android:paddingTop="@dimen/padding_spacing_dp4"
                 android:paddingEnd="@dimen/padding_spacing_dp8">
 
                 <TextView

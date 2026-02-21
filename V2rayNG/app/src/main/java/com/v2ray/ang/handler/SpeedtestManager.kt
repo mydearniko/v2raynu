@@ -9,14 +9,23 @@ import com.v2ray.ang.dto.IPAPIInfo
 import com.v2ray.ang.util.HttpUtil
 import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.Utils
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.selects.select
 import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.UnknownHostException
 
 object SpeedtestManager {
+
+    private const val PARALLEL_CHECK_ATTEMPTS = 3
+    private const val IP_CHECK_TIMEOUT_MS = 5000
+    private const val GEO_CHECK_TIMEOUT_MS = 7000
 
     private val tcpTestingSockets = ArrayList<Socket?>()
 
@@ -150,35 +159,96 @@ object SpeedtestManager {
      * Performs multi-source IP lookups and then resolves each discovered IP with:
      * https://i.idanya.ru/who/$IP
      *
-     * Returns a short two-line summary suitable for UI display.
+     * For each source (A/B), 3 parallel requests are fired and the first valid result wins.
+     * Then 3 parallel Geo lookups are fired for that IP and the first valid result wins.
      */
-    fun getRemoteIpAndGeoInfoSummary(): String? {
-        val httpPort = SettingsManager.getHttpPort()
-        val checks = listOf(
-            "A" to SettingsManager.getIpCheckUrlA(),
-            "B" to SettingsManager.getIpCheckUrlB()
+    suspend fun getRemoteIpAndGeoInfoSummary(
+        onPartialUpdate: ((String) -> Unit)? = null,
+        httpPortOverride: Int? = null
+    ): String? = coroutineScope {
+        val httpPort = httpPortOverride ?: SettingsManager.getHttpPort()
+
+        val pending = mutableListOf(
+            async(Dispatchers.IO) {
+                "A" to resolveIpGeoSummary(
+                    ipCheckUrl = SettingsManager.getIpCheckUrlA(),
+                    httpPort = httpPort
+                )
+            },
+            async(Dispatchers.IO) {
+                "B" to resolveIpGeoSummary(
+                    ipCheckUrl = SettingsManager.getIpCheckUrlB(),
+                    httpPort = httpPort
+                )
+            }
         )
+        val resolved = linkedMapOf<String, String>()
 
-        val lines = mutableListOf<String>()
-        checks.forEach { (label, url) ->
-            try {
-                val rawIpBody = HttpUtil.getUrlContent(url, 5000, httpPort)
-                val ip = extractFirstIp(rawIpBody)
-                if (ip == null) {
-                    lines.add("IP $label: unavailable")
-                    return@forEach
+        while (pending.isNotEmpty()) {
+            val (finished, result) = select<Pair<Deferred<Pair<String, String>>, Pair<String, String>>> {
+                pending.forEach { task ->
+                    task.onAwait { value -> task to value }
                 }
+            }
+            pending.remove(finished)
+            resolved[result.first] = result.second
+            buildIpGeoSummaryLines(resolved)?.let { onPartialUpdate?.invoke(it) }
+        }
 
-                val whoUrl = "https://i.idanya.ru/who/${Utils.urlEncode(ip)}"
-                val whoBody = HttpUtil.getUrlContent(whoUrl, 7000, httpPort)
-                val whoSummary = summarizeGeoBody(whoBody)
-                lines.add("IP $label: ${whoSummary ?: ip}")
-            } catch (e: Exception) {
-                Log.w(AppConfig.TAG, "IP/Geo check failed for source $label", e)
-                lines.add("IP $label: unavailable")
+        buildIpGeoSummaryLines(resolved)
+    }
+
+    private suspend fun resolveIpGeoSummary(ipCheckUrl: String, httpPort: Int): String {
+        val ip = firstNonNull(PARALLEL_CHECK_ATTEMPTS) {
+            extractFirstIp(HttpUtil.getUrlContent(ipCheckUrl, IP_CHECK_TIMEOUT_MS, httpPort))
+        } ?: return "unavailable"
+
+        val whoUrl = "https://i.idanya.ru/who/${Utils.urlEncode(ip)}"
+        val whoSummary = firstNonNull(PARALLEL_CHECK_ATTEMPTS) {
+            summarizeGeoBody(HttpUtil.getUrlContent(whoUrl, GEO_CHECK_TIMEOUT_MS, httpPort))
+                ?.takeIf { it.isNotBlank() }
+        }
+        return whoSummary ?: ip
+    }
+
+    private suspend fun <T> firstNonNull(attempts: Int, task: suspend () -> T?): T? = coroutineScope {
+        if (attempts <= 0) {
+            return@coroutineScope null
+        }
+
+        val pending = MutableList(attempts) {
+            async(Dispatchers.IO) {
+                try {
+                    task()
+                } catch (e: Exception) {
+                    Log.w(AppConfig.TAG, "Parallel check attempt failed", e)
+                    null
+                }
             }
         }
 
+        try {
+            while (pending.isNotEmpty()) {
+                val (finished, value) = select<Pair<Deferred<T?>, T?>> {
+                    pending.forEach { deferred ->
+                        deferred.onAwait { resolved -> deferred to resolved }
+                    }
+                }
+                pending.remove(finished)
+                if (value != null) {
+                    return@coroutineScope value
+                }
+            }
+            null
+        } finally {
+            pending.forEach { it.cancel() }
+        }
+    }
+
+    private fun buildIpGeoSummaryLines(resolved: Map<String, String>): String? {
+        val lines = listOf("A", "B").mapNotNull { label ->
+            resolved[label]?.let { "IP $label: $it" }
+        }
         return lines.takeIf { it.isNotEmpty() }?.joinToString("\n")
     }
 

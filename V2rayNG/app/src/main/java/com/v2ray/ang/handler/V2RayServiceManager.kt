@@ -243,13 +243,17 @@ object V2RayServiceManager {
             var errorStr = ""
             var details: String? = null
 
+            fun isCurrentRequestActive(): Boolean {
+                return isActive && generation == delayMeasureGeneration.get()
+            }
+
             try {
                 time = coreController.measureDelay(SettingsManager.getDelayTestUrl())
             } catch (e: Exception) {
                 Log.e(AppConfig.TAG, "Failed to measure delay with primary URL", e)
                 errorStr = e.message?.substringAfter("\":") ?: "empty message"
             }
-            if (!isActive || generation != delayMeasureGeneration.get()) return@launch
+            if (!isCurrentRequestActive()) return@launch
             if (time == -1L) {
                 try {
                     time = coreController.measureDelay(SettingsManager.getDelayTestUrl(true))
@@ -258,7 +262,7 @@ object V2RayServiceManager {
                     errorStr = e.message?.substringAfter("\":") ?: "empty message"
                 }
             }
-            if (!isActive || generation != delayMeasureGeneration.get()) return@launch
+            if (!isCurrentRequestActive()) return@launch
 
             val result = if (time >= 0) {
                 service.getString(R.string.connection_test_available, time)
@@ -269,12 +273,24 @@ object V2RayServiceManager {
             // Only fetch IP/Geo details if the delay test was successful
             if (time >= 0) {
                 try {
-                    details = SpeedtestManager.getRemoteIpAndGeoInfoSummary()
+                    var lastPartialDetails: String? = null
+                    details = SpeedtestManager.getRemoteIpAndGeoInfoSummary(
+                        onPartialUpdate = { partial ->
+                            if (!isCurrentRequestActive()) return@getRemoteIpAndGeoInfoSummary
+                            if (partial == lastPartialDetails) return@getRemoteIpAndGeoInfoSummary
+                            lastPartialDetails = partial
+                            MessageUtil.sendMsg2UI(
+                                service,
+                                AppConfig.MSG_MEASURE_DELAY_SUCCESS,
+                                "$result\n$partial"
+                            )
+                        }
+                    )
                 } catch (e: Exception) {
                     Log.e(AppConfig.TAG, "Failed to fetch remote IP/Geo details", e)
                 }
             }
-            if (!isActive || generation != delayMeasureGeneration.get()) return@launch
+            if (!isCurrentRequestActive()) return@launch
 
             val content = if (details.isNullOrBlank()) result else "$result\n$details"
             MessageUtil.sendMsg2UI(service, AppConfig.MSG_MEASURE_DELAY_SUCCESS, content)

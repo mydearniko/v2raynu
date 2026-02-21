@@ -9,6 +9,7 @@ import android.util.Log
 import android.view.KeyEvent
 import android.view.Menu
 import android.view.MenuItem
+import android.widget.FrameLayout
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -16,6 +17,7 @@ import androidx.appcompat.app.ActionBarDrawerToggle
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.SearchView
 import androidx.core.content.ContextCompat
+import androidx.core.view.doOnLayout
 import androidx.core.view.GravityCompat
 import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
@@ -95,6 +97,7 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
 
         binding.fab.setOnClickListener { handleFabAction() }
         binding.layoutTest.setOnClickListener { handleLayoutTestClick() }
+        binding.layoutTest.doOnLayout { updateFabBottomMargin() }
 
         setupGroupTab()
         setupViewModel()
@@ -178,6 +181,16 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
 
     private fun setTestState(content: String?) {
         binding.tvTestState.text = content
+        binding.layoutTest.post { updateFabBottomMargin() }
+    }
+
+    private fun updateFabBottomMargin() {
+        val params = binding.fab.layoutParams as? FrameLayout.LayoutParams ?: return
+        val targetBottomMargin =
+            binding.layoutTest.height + resources.getDimensionPixelSize(R.dimen.padding_spacing_dp16)
+        if (params.bottomMargin == targetBottomMargin) return
+        params.bottomMargin = targetBottomMargin
+        binding.fab.layoutParams = params
     }
 
     private fun shouldShowDefaultConnectedState(): Boolean {

@@ -26,7 +26,11 @@ import com.v2ray.ang.handler.AngConfigManager
 import com.v2ray.ang.handler.MmkvManager
 import com.v2ray.ang.handler.SettingsManager
 import com.v2ray.ang.handler.SpeedtestManager
+import com.v2ray.ang.handler.V2RayNativeManager
+import com.v2ray.ang.handler.V2RayServiceManager
+import com.v2ray.ang.handler.V2rayConfigManager
 import com.v2ray.ang.service.RealPingBatchStore
+import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.MessageUtil
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
@@ -36,7 +40,9 @@ import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import libv2ray.CoreCallbackHandler
 import java.util.Collections
+import java.util.concurrent.atomic.AtomicLong
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var serverList = MmkvManager.decodeServerList()
@@ -52,6 +58,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var isDelayCheckPending = false
     private var delayCheckTimeoutJob: Job? = null
     private var delayCheckRequestedAtMs = 0L
+    private var standaloneDelayCheckJob: Job? = null
+    private val standaloneDelayGeneration = AtomicLong(0L)
 
     private fun requestDelayCheck() {
         delayCheckRequestedAtMs = SystemClock.elapsedRealtime()
@@ -78,9 +86,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun cancelRunningTests() {
         tcpingTestScope.coroutineContext[Job]?.cancelChildren()
+        standaloneDelayGeneration.incrementAndGet()
+        standaloneDelayCheckJob?.cancel()
+        standaloneDelayCheckJob = null
         SpeedtestManager.closeAllTcpSockets()
         MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_MEASURE_DELAY_CANCEL, "")
         MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG_CANCEL, "")
+        clearDelayCheckPending()
     }
 
     /**
@@ -288,6 +300,170 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun testCurrentServerRealPing() {
         cancelRunningTests()
+        if (!V2RayServiceManager.isRunning()) {
+            testCurrentServerDelayWithoutService()
+            return
+        }
+        startServiceBackedDelayCheck(showTestingState = false)
+    }
+
+    private fun testCurrentServerDelayWithoutService() {
+        val generation = standaloneDelayGeneration.incrementAndGet()
+        standaloneDelayCheckJob?.cancel()
+        standaloneDelayCheckJob = viewModelScope.launch(Dispatchers.IO) {
+            val app = getApplication<AngApplication>()
+            val selectedGuid = MmkvManager.getSelectServer()
+            if (selectedGuid.isNullOrBlank()) {
+                updateTestResultAction.postValue(app.getString(R.string.connection_not_connected))
+                return@launch
+            }
+
+            try {
+                V2RayNativeManager.initCoreEnv(app)
+                V2RayNativeManager.setRealPingAttemptTimeoutMillis(
+                    SettingsManager.getRealPingAttemptTimeoutMillis().toLong()
+                )
+
+                val configResult = V2rayConfigManager.getV2rayConfig4Speedtest(app, selectedGuid)
+                if (!configResult.status || configResult.content.isBlank()) {
+                    if (generation == standaloneDelayGeneration.get()) {
+                        updateTestResultAction.postValue(app.getString(R.string.connection_test_fail))
+                    }
+                    return@launch
+                }
+
+                var delayMillis = V2RayNativeManager.measureOutboundDelay(
+                    configResult.content,
+                    SettingsManager.getDelayTestUrl()
+                )
+                if (delayMillis < 0L && generation == standaloneDelayGeneration.get()) {
+                    delayMillis = V2RayNativeManager.measureOutboundDelay(
+                        configResult.content,
+                        SettingsManager.getDelayTestUrl(true)
+                    )
+                }
+
+                if (generation != standaloneDelayGeneration.get()) {
+                    return@launch
+                }
+
+                val result = if (delayMillis >= 0L) {
+                    app.getString(R.string.connection_test_available, delayMillis)
+                } else {
+                    app.getString(R.string.connection_test_fail)
+                }
+                updateTestResultAction.postValue(result)
+
+                if (delayMillis >= 0L) {
+                    var lastPartialDetails: String? = null
+                    val details = fetchStandaloneIpGeoSummary(
+                        selectedGuid = selectedGuid,
+                        generation = generation
+                    ) { partial ->
+                        if (partial == lastPartialDetails) return@fetchStandaloneIpGeoSummary
+                        lastPartialDetails = partial
+                        updateTestResultAction.postValue("$result\n$partial")
+                    }
+
+                    if (generation != standaloneDelayGeneration.get()) {
+                        return@launch
+                    }
+                    val content = if (details.isNullOrBlank()) result else "$result\n$details"
+                    updateTestResultAction.postValue(content)
+                }
+            } catch (e: Exception) {
+                Log.e(AppConfig.TAG, "Standalone delay check failed", e)
+                if (generation == standaloneDelayGeneration.get()) {
+                    updateTestResultAction.postValue(
+                        app.getString(R.string.connection_test_error, e.message ?: "unknown")
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun fetchStandaloneIpGeoSummary(
+        selectedGuid: String,
+        generation: Long,
+        onPartialUpdate: (String) -> Unit
+    ): String? {
+        if (generation != standaloneDelayGeneration.get()) {
+            return null
+        }
+
+        val app = getApplication<AngApplication>()
+        val configResult = V2rayConfigManager.getV2rayConfig(app, selectedGuid)
+        if (!configResult.status || configResult.content.isBlank()) {
+            return SpeedtestManager.getRemoteIpAndGeoInfoSummary(
+                onPartialUpdate = { partial ->
+                    if (generation == standaloneDelayGeneration.get()) {
+                        onPartialUpdate(partial)
+                    }
+                },
+                httpPortOverride = 0
+            )
+        }
+
+        val runtimeConfig = stripTunInbound(configResult.content)
+        val controller = V2RayNativeManager.newCoreController(object : CoreCallbackHandler {
+            override fun startup(): Long = 0
+            override fun shutdown(): Long = 0
+            override fun onEmitStatus(l: Long, s: String?): Long = 0
+        })
+
+        return try {
+            controller.startLoop(runtimeConfig, 0)
+            val httpPort = if (controller.isRunning) SettingsManager.getHttpPort() else 0
+            SpeedtestManager.getRemoteIpAndGeoInfoSummary(
+                onPartialUpdate = { partial ->
+                    if (generation == standaloneDelayGeneration.get()) {
+                        onPartialUpdate(partial)
+                    }
+                },
+                httpPortOverride = httpPort
+            )
+        } catch (e: Exception) {
+            Log.e(AppConfig.TAG, "Failed to start temporary core for standalone IP checks", e)
+            SpeedtestManager.getRemoteIpAndGeoInfoSummary(
+                onPartialUpdate = { partial ->
+                    if (generation == standaloneDelayGeneration.get()) {
+                        onPartialUpdate(partial)
+                    }
+                },
+                httpPortOverride = 0
+            )
+        } finally {
+            runCatching {
+                if (controller.isRunning) {
+                    controller.stopLoop()
+                }
+            }.onFailure { err ->
+                Log.e(AppConfig.TAG, "Failed to stop temporary core for standalone IP checks", err)
+            }
+        }
+    }
+
+    private fun stripTunInbound(configJson: String): String {
+        val root = JsonUtil.parseString(configJson) ?: return configJson
+        val inbounds = root.getAsJsonArray("inbounds") ?: return configJson
+        val filtered = com.google.gson.JsonArray()
+        inbounds.forEach { inbound ->
+            val inboundObj = inbound?.asJsonObject ?: return@forEach
+            val protocol = inboundObj.get("protocol")?.asString?.lowercase().orEmpty()
+            val tag = inboundObj.get("tag")?.asString?.lowercase().orEmpty()
+            if (protocol == "tun" || tag == "tun") {
+                return@forEach
+            }
+            filtered.add(inboundObj)
+        }
+        root.add("inbounds", filtered)
+        return JsonUtil.toJson(root)
+    }
+
+    private fun startServiceBackedDelayCheck(showTestingState: Boolean) {
+        if (showTestingState) {
+            updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_test_testing)
+        }
         isDelayCheckPending = true
         MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_REGISTER_CLIENT, "")
         requestDelayCheck()
@@ -552,7 +728,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 AppConfig.MSG_STATE_START_SUCCESS -> {
                     getApplication<AngApplication>().toastSuccess(R.string.toast_services_success)
                     updateRunningState(true)
-                    retryDelayCheckIfNeeded()
+                    if (!isDelayCheckPending) {
+                        startServiceBackedDelayCheck(showTestingState = true)
+                    } else {
+                        retryDelayCheckIfNeeded()
+                    }
                 }
 
                 AppConfig.MSG_STATE_START_FAILURE -> {

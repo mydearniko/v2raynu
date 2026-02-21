@@ -18,10 +18,10 @@ import com.v2ray.ang.databinding.ItemRecyclerMainBinding
 import com.v2ray.ang.dto.ProfileItem
 import com.v2ray.ang.dto.ServersCache
 import com.v2ray.ang.extension.nullIfBlank
-import com.v2ray.ang.handler.AngConfigManager
 import com.v2ray.ang.handler.MmkvManager
 import com.v2ray.ang.helper.ItemTouchHelperAdapter
 import com.v2ray.ang.helper.ItemTouchHelperViewHolder
+import com.v2ray.ang.util.Utils
 import com.v2ray.ang.viewmodel.MainViewModel
 import java.util.Collections
 
@@ -131,12 +131,30 @@ class MainRecyclerAdapter(
 
     /**
      * Gets the server address information
-     * Hides part of IP or domain information for privacy protection
+     * Shows full address and optional SNI.
      * @param profile The server configuration
      * @return Formatted address string
      */
     private fun getAddress(profile: ProfileItem): String {
-        return profile.description.nullIfBlank() ?: AngConfigManager.generateDescription(profile)
+        val endpoint = buildFullEndpoint(profile)
+        val sni = profile.sni.nullIfBlank()
+        return if (sni != null) {
+            "$endpoint\n$sni"
+        } else {
+            endpoint
+        }
+    }
+
+    private fun buildFullEndpoint(profile: ProfileItem): String {
+        val server = profile.server.nullIfBlank()
+        val port = profile.serverPort.nullIfBlank()
+
+        if (server == null && port == null) {
+            return profile.description.nullIfBlank().orEmpty()
+        }
+
+        val host = server?.let { Utils.getIpv6Address(it) }.orEmpty()
+        return if (port != null) "$host:$port" else host
     }
 
     /**
