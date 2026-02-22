@@ -47,15 +47,16 @@
                     android:orientation="vertical">
 
                     <LinearLayout
-                        android:layout_width="wrap_content"
+                        android:layout_width="match_parent"
                         android:layout_height="wrap_content"
                         android:orientation="vertical"
                         android:paddingStart="@dimen/padding_spacing_dp8">
 
                         <TextView
                             android:id="@+id/tv_name"
-                            android:layout_width="wrap_content"
+                            android:layout_width="match_parent"
                             android:layout_height="wrap_content"
+                            android:ellipsize="end"
                             android:maxLines="2"
                             android:minLines="1"
                             android:textAppearance="@style/TextAppearance.AppCompat.Subhead" />
@@ -86,16 +87,33 @@
                                     app:layout_constraintTop_toTopOf="parent" />
                             </androidx.constraintlayout.widget.ConstraintLayout>
 
-                            <TextView
-                                android:id="@+id/tv_statistics"
+                            <LinearLayout
                                 android:layout_width="0dp"
                                 android:layout_height="wrap_content"
                                 android:layout_weight="1"
-                                android:ellipsize="end"
-                                android:maxLines="3"
-                                android:minLines="1"
-                                android:textAppearance="@style/TextAppearance.AppCompat.Small"
-                                tools:text="185.120.14.20:443\nSNI: edge.example.com" />
+                                android:orientation="vertical">
+
+                                <TextView
+                                    android:id="@+id/tv_statistics"
+                                    android:layout_width="match_parent"
+                                    android:layout_height="wrap_content"
+                                    android:ellipsize="end"
+                                    android:maxLines="1"
+                                    android:minLines="1"
+                                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                                    tools:text="185.120.14.20:443" />
+
+                                <TextView
+                                    android:id="@+id/tv_sni"
+                                    android:layout_width="match_parent"
+                                    android:layout_height="wrap_content"
+                                    android:ellipsize="end"
+                                    android:maxLines="1"
+                                    android:minLines="1"
+                                    android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                                    android:visibility="gone"
+                                    tools:text="ads.x5.ru" />
+                            </LinearLayout>
 
                         </LinearLayout>
 

@@ -32,6 +32,8 @@ class MainRecyclerAdapter(
     companion object {
         private const val VIEW_TYPE_ITEM = 1
         private const val VIEW_TYPE_FOOTER = 2
+        private val CONTROL_OR_WHITESPACE_REGEX = Regex("[\\u0000-\\u001F\\u007F\\s]")
+        private val CONTROL_REGEX = Regex("[\\u0000-\\u001F\\u007F]+")
     }
 
     private val doubleColumnDisplay = MmkvManager.decodeSettingsBool(AppConfig.PREF_DOUBLE_COLUMN_DISPLAY, false)
@@ -60,7 +62,15 @@ class MainRecyclerAdapter(
 
             //Name address
             holder.itemMainBinding.tvName.text = profile.remarks
-            holder.itemMainBinding.tvStatistics.text = getAddress(profile)
+            val (endpoint, sni) = getAddress(profile)
+            holder.itemMainBinding.tvStatistics.text = endpoint
+            if (sni != null) {
+                holder.itemMainBinding.tvSni.visibility = View.VISIBLE
+                holder.itemMainBinding.tvSni.text = sni
+            } else {
+                holder.itemMainBinding.tvSni.visibility = View.GONE
+                holder.itemMainBinding.tvSni.text = ""
+            }
             holder.itemMainBinding.tvType.text = profile.configType.name
 
             //TestResult
@@ -131,30 +141,60 @@ class MainRecyclerAdapter(
 
     /**
      * Gets the server address information
-     * Shows full address and optional SNI.
+     * Shows endpoint and optional SNI-like host information.
      * @param profile The server configuration
-     * @return Formatted address string
+     * @return endpoint and optional second-line value
      */
-    private fun getAddress(profile: ProfileItem): String {
+    private fun getAddress(profile: ProfileItem): Pair<String, String?> {
         val endpoint = buildFullEndpoint(profile)
-        val sni = profile.sni.nullIfBlank()
-        return if (sni != null) {
-            "$endpoint\n$sni"
-        } else {
-            endpoint
-        }
+        val sni = pickSecondaryHost(profile)
+        return endpoint to sni
     }
 
     private fun buildFullEndpoint(profile: ProfileItem): String {
-        val server = profile.server.nullIfBlank()
-        val port = profile.serverPort.nullIfBlank()
+        val server = normalizeEndpointPart(profile.server)
+        val port = normalizeEndpointPart(profile.serverPort)
 
         if (server == null && port == null) {
-            return profile.description.nullIfBlank().orEmpty()
+            return normalizeSingleLine(profile.description) ?: ""
         }
 
         val host = server?.let { Utils.getIpv6Address(it) }.orEmpty()
         return if (port != null) "$host:$port" else host
+    }
+
+    private fun pickSecondaryHost(profile: ProfileItem): String? {
+        val sni = extractPrimaryValue(profile.sni)
+        if (sni != null) return sni
+
+        val host = extractPrimaryValue(profile.host)
+        if (host != null) return host
+
+        return extractPrimaryValue(profile.authority)
+    }
+
+    private fun normalizeEndpointPart(value: String?): String? {
+        return value
+            ?.replace(CONTROL_OR_WHITESPACE_REGEX, "")
+            ?.nullIfBlank()
+    }
+
+    private fun normalizeSingleLine(value: String?): String? {
+        return value
+            ?.replace(CONTROL_REGEX, " ")
+            ?.trim()
+            ?.nullIfBlank()
+    }
+
+    private fun extractPrimaryValue(value: String?): String? {
+        if (value.isNullOrBlank()) return null
+        return value
+            .replace('\r', ',')
+            .replace('\n', ',')
+            .split(',')
+            .firstOrNull { it.isNotBlank() }
+            ?.trim()
+            ?.nullIfBlank()
     }
 
     /**

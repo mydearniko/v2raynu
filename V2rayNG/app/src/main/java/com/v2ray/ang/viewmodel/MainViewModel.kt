@@ -48,8 +48,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var serverList = MmkvManager.decodeServerList()
     var subscriptionId: String = MmkvManager.decodeSettingsString(AppConfig.CACHE_SUBSCRIPTION_ID, "").orEmpty()
 
-    //var keywordFilter: String = MmkvManager.MmkvManager.decodeSettingsString(AppConfig.CACHE_KEYWORD_FILTER, "")?:""
-    var keywordFilter = ""
+    var keywordFilter: String = MmkvManager.decodeSettingsString(AppConfig.CACHE_KEYWORD_FILTER, "").orEmpty()
     val serversCache = mutableListOf<ServersCache>()
     val isRunning by lazy { MutableLiveData<Boolean>() }
     val updateListAction by lazy { MutableLiveData<Int>() }
@@ -192,6 +191,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     @Synchronized
     fun updateCache() {
+        val keyword = keywordFilter.trim().lowercase()
         serversCache.clear()
         for (guid in serverList) {
             val profile = MmkvManager.decodeServerConfig(guid) ?: continue
@@ -212,9 +212,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 continue
             }
 
-            if (keywordFilter.isEmpty() || profile.remarks.lowercase().contains(keywordFilter.lowercase())) {
+            if (keyword.isEmpty() || matchesKeyword(profile, keyword)) {
                 serversCache.add(ServersCache(guid, profile))
             }
+        }
+    }
+
+    private fun matchesKeyword(profile: com.v2ray.ang.dto.ProfileItem, keyword: String): Boolean {
+        if (keyword.isEmpty()) return true
+
+        val searchableFields = sequenceOf(
+            profile.remarks,
+            profile.sni,
+            profile.host,
+            profile.authority
+        )
+
+        return searchableFields.any { field ->
+            field
+                ?.replace('\n', ',')
+                ?.replace('\r', ',')
+                ?.lowercase()
+                ?.contains(keyword) == true
         }
     }
 
@@ -280,7 +299,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Tests the real ping for all servers.
      */
     fun testAllRealPing() {
-        MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG_CANCEL, "")
+        // Do not send MSG_MEASURE_CONFIG_CANCEL here.
+        // V2RayTestService already cancels the previous batch when a new MSG_MEASURE_CONFIG arrives.
         updateListAction.value = -1
 
         val guids = ArrayList<String>(serversCache.map { it.guid })

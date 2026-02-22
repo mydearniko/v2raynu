@@ -37,27 +37,33 @@ object SubscriptionUpdater {
             Log.i(AppConfig.TAG, "subscription automatic update starting")
 
             val subs = MmkvManager.decodeSubscriptions().filter { it.subscription.autoUpdate }
+            return try {
+                for (sub in subs) {
+                    val subItem = sub.subscription
 
-            for (sub in subs) {
-                val subItem = sub.subscription
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        notification.setChannelId(AppConfig.SUBSCRIPTION_UPDATE_CHANNEL)
+                        val channel =
+                            NotificationChannel(
+                                AppConfig.SUBSCRIPTION_UPDATE_CHANNEL,
+                                AppConfig.SUBSCRIPTION_UPDATE_CHANNEL_NAME,
+                                NotificationManager.IMPORTANCE_MIN
+                            )
+                        notificationManager.createNotificationChannel(channel)
+                    }
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    notification.setChannelId(AppConfig.SUBSCRIPTION_UPDATE_CHANNEL)
-                    val channel =
-                        NotificationChannel(
-                            AppConfig.SUBSCRIPTION_UPDATE_CHANNEL,
-                            AppConfig.SUBSCRIPTION_UPDATE_CHANNEL_NAME,
-                            NotificationManager.IMPORTANCE_MIN
-                        )
-                    notificationManager.createNotificationChannel(channel)
+                    notification.setContentText("Updating ${subItem.remarks}")
+                    notificationManager.notify(3, notification.build())
+                    Log.i(AppConfig.TAG, "subscription automatic update: ---${subItem.remarks}")
+                    AngConfigManager.updateConfigViaSub(sub)
                 }
-                notificationManager.notify(3, notification.build())
-                Log.i(AppConfig.TAG, "subscription automatic update: ---${subItem.remarks}")
-                AngConfigManager.updateConfigViaSub(sub)
-                notification.setContentText("Updating ${subItem.remarks}")
+                Result.success()
+            } catch (e: Exception) {
+                Log.e(AppConfig.TAG, "subscription automatic update failed", e)
+                Result.failure()
+            } finally {
+                notificationManager.cancel(3)
             }
-            notificationManager.cancel(3)
-            return Result.success()
         }
     }
 }

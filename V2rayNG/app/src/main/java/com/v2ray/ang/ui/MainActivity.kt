@@ -38,11 +38,17 @@ import com.v2ray.ang.handler.V2RayServiceManager
 import com.v2ray.ang.util.Utils
 import com.v2ray.ang.viewmodel.MainViewModel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelectedListener {
+    companion object {
+        private const val SUBSCRIPTION_UPDATE_TIMEOUT_MS = 180_000L
+    }
+
     private val binding by lazy {
         ActivityMainBinding.inflate(layoutInflater)
     }
@@ -50,6 +56,8 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
     val mainViewModel: MainViewModel by viewModels()
     private lateinit var groupPagerAdapter: GroupPagerAdapter
     private var tabMediator: TabLayoutMediator? = null
+    private var subscriptionUpdateJob: Job? = null
+    private var suppressNextSearchClear = false
 
     private val requestVpnPermission = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
         if (it.resultCode == RESULT_OK) {
@@ -237,19 +245,52 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
         val searchItem = menu.findItem(R.id.search_view)
         if (searchItem != null) {
             val searchView = searchItem.actionView as SearchView
+            val restoreQuery = {
+                val current = mainViewModel.keywordFilter
+                if (searchView.query?.toString().orEmpty() != current) {
+                    searchView.setQuery(current, false)
+                }
+            }
             searchView.setOnQueryTextListener(object : SearchView.OnQueryTextListener {
                 override fun onQueryTextSubmit(query: String?): Boolean = false
 
                 override fun onQueryTextChange(newText: String?): Boolean {
+                    val text = newText.orEmpty()
+                    if (text.isEmpty() && mainViewModel.keywordFilter.isNotEmpty() && suppressNextSearchClear) {
+                        suppressNextSearchClear = false
+                        return true
+                    }
+                    suppressNextSearchClear = false
                     mainViewModel.filterConfig(newText.orEmpty())
                     return false
                 }
             })
 
+            // Keep the active filter state when the search view is recreated/collapsed.
+            restoreQuery()
+            searchView.clearFocus()
+            searchView.setOnSearchClickListener {
+                suppressNextSearchClear = false
+                restoreQuery()
+            }
+
             searchView.setOnCloseListener {
-                mainViewModel.filterConfig("")
+                suppressNextSearchClear = true
                 false
             }
+
+            searchItem.setOnActionExpandListener(object : MenuItem.OnActionExpandListener {
+                override fun onMenuItemActionExpand(item: MenuItem): Boolean {
+                    suppressNextSearchClear = false
+                    restoreQuery()
+                    return true
+                }
+
+                override fun onMenuItemActionCollapse(item: MenuItem): Boolean {
+                    suppressNextSearchClear = true
+                    return true
+                }
+            })
         }
         return super.onCreateOptionsMenu(menu)
     }
@@ -457,19 +498,28 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
      * import config from sub
      */
     private fun importConfigViaSub(): Boolean {
-        showLoading()
+        if (subscriptionUpdateJob?.isActive == true) return true
 
-        lifecycleScope.launch(Dispatchers.IO) {
-            val count = mainViewModel.updateConfigViaSubAll()
-            delay(500L)
-            launch(Dispatchers.Main) {
-                if (count > 0) {
+        subscriptionUpdateJob = lifecycleScope.launch {
+            showLoading()
+            try {
+                val count = withTimeoutOrNull(SUBSCRIPTION_UPDATE_TIMEOUT_MS) {
+                    withContext(Dispatchers.IO) {
+                        mainViewModel.updateConfigViaSubAll()
+                    }
+                }
+                if (count != null && count > 0) {
                     toast(getString(R.string.title_update_config_count, count))
                     mainViewModel.reloadServerList()
                 } else {
                     toastError(R.string.toast_failure)
                 }
+            } catch (e: Exception) {
+                Log.e(AppConfig.TAG, "Failed to import config via subscription", e)
+                toastError(R.string.toast_failure)
+            } finally {
                 hideLoading()
+                subscriptionUpdateJob = null
             }
         }
         return true

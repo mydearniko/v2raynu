@@ -27,16 +27,23 @@ import com.v2ray.ang.util.QRCodeDecoder
 import com.v2ray.ang.util.Utils
 import com.v2ray.ang.viewmodel.SubscriptionsViewModel
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 class SubSettingActivity : BaseActivity() {
+    companion object {
+        private const val SUBSCRIPTION_UPDATE_TIMEOUT_MS = 180_000L
+    }
+
     private val binding by lazy { ActivitySubSettingBinding.inflate(layoutInflater) }
     private val ownerActivity: SubSettingActivity
         get() = this
     private val viewModel: SubscriptionsViewModel by viewModels()
     private lateinit var adapter: SubSettingRecyclerAdapter
     private var mItemTouchHelper: ItemTouchHelper? = null
+    private var subscriptionUpdateJob: Job? = null
     private val share_method: Array<out String> by lazy {
         resources.getStringArray(R.array.share_sub_method)
     }
@@ -74,22 +81,7 @@ class SubSettingActivity : BaseActivity() {
         }
 
         R.id.sub_update -> {
-            showLoading()
-
-            lifecycleScope.launch(Dispatchers.IO) {
-                val count = AngConfigManager.updateConfigViaSubAll()
-                delay(500L)
-                launch(Dispatchers.Main) {
-                    if (count > 0) {
-                        toastSuccess(R.string.toast_success)
-                        refreshData()
-                    } else {
-                        toastError(R.string.toast_failure)
-                    }
-                    hideLoading()
-                }
-            }
-
+            updateSubscriptions()
             true
         }
 
@@ -101,6 +93,34 @@ class SubSettingActivity : BaseActivity() {
     fun refreshData() {
         viewModel.reload()
         adapter.notifyDataSetChanged()
+    }
+
+    private fun updateSubscriptions() {
+        if (subscriptionUpdateJob?.isActive == true) return
+
+        subscriptionUpdateJob = lifecycleScope.launch {
+            showLoading()
+            try {
+                val count = withTimeoutOrNull(SUBSCRIPTION_UPDATE_TIMEOUT_MS) {
+                    withContext(Dispatchers.IO) {
+                        AngConfigManager.updateConfigViaSubAll()
+                    }
+                }
+
+                if (count != null && count > 0) {
+                    toastSuccess(R.string.toast_success)
+                    refreshData()
+                } else {
+                    toastError(R.string.toast_failure)
+                }
+            } catch (e: Exception) {
+                Log.e(AppConfig.TAG, "Failed to update subscriptions", e)
+                toastError(R.string.toast_failure)
+            } finally {
+                hideLoading()
+                subscriptionUpdateJob = null
+            }
+        }
     }
 
     private inner class ActivityAdapterListener : BaseAdapterListener {
