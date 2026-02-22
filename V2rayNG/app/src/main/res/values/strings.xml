@@ -187,6 +187,9 @@
     <string name="title_pref_fake_dns_enabled">Enable fake DNS</string>
     <string name="summary_pref_fake_dns_enabled">Local DNS returns fake IP addresses (faster, but it may not work for some apps)</string>
 
+    <string name="title_pref_disable_ipv6">Disable IPv6 entirely</string>
+    <string name="summary_pref_disable_ipv6">Force IPv4-only behavior and disable IPv6 routes/resolution in core and checks</string>
+
     <string name="title_pref_prefer_ipv6">Prefer IPv6</string>
     <string name="summary_pref_prefer_ipv6">Enable IPv6 routes and Prefer IPv6 addresses</string>
 

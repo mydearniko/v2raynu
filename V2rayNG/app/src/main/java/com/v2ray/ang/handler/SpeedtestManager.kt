@@ -26,6 +26,8 @@ object SpeedtestManager {
     private const val PARALLEL_CHECK_ATTEMPTS = 3
     private const val IP_CHECK_TIMEOUT_MS = 5000
     private const val GEO_CHECK_TIMEOUT_MS = 7000
+    private val IPV4_REGEX =
+        Regex("^([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])$")
 
     private val tcpTestingSockets = ArrayList<Socket?>()
 
@@ -59,12 +61,22 @@ object SpeedtestManager {
      */
     fun socketConnectTime(url: String, port: Int): Long {
         try {
+            val targetHost = if (Utils.isPureIpAddress(url)) {
+                if (url.contains(':')) {
+                    return -1
+                }
+                url
+            } else {
+                HttpUtil.resolveHostToIP(url, ipv6Preferred = false, ipv4Only = true)?.firstOrNull()
+                    ?: return -1
+            }
+
             val socket = Socket()
             synchronized(this) {
                 tcpTestingSockets.add(socket)
             }
             val start = System.currentTimeMillis()
-            socket.connect(InetSocketAddress(url, port), 3000)
+            socket.connect(InetSocketAddress(targetHost, port), 3000)
             val time = System.currentTimeMillis() - start
             synchronized(this) {
                 tcpTestingSockets.remove(socket)
@@ -256,14 +268,18 @@ object SpeedtestManager {
         if (body.isNullOrBlank()) return null
 
         val trimmed = body.trim()
-        if (Utils.isPureIpAddress(trimmed)) {
+        if (isIpv4Address(trimmed)) {
             return trimmed
         }
 
-        val candidateRegex = Regex("[0-9A-Fa-f:.]+")
+        val candidateRegex = Regex("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b")
         return candidateRegex.findAll(trimmed)
             .map { it.value.trim('[', ']', '(', ')', '{', '}', '<', '>', ',', ';', '"', '\'') }
-            .firstOrNull { token -> token.isNotEmpty() && Utils.isPureIpAddress(token) }
+            .firstOrNull { token -> token.isNotEmpty() && isIpv4Address(token) }
+    }
+
+    private fun isIpv4Address(value: String): Boolean {
+        return IPV4_REGEX.matches(value)
     }
 
     private fun summarizeGeoBody(body: String?): String? {

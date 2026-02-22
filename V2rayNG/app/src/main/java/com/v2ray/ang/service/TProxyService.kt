@@ -63,7 +63,7 @@ class TProxyService(
             appendLine("  mtu: ${SettingsManager.getVpnMtu()}")
             appendLine("  ipv4: ${vpnConfig.ipv4Client}")
 
-            if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6)) {
+            if (SettingsManager.isIpv6Enabled()) {
                 appendLine("  ipv6: '${vpnConfig.ipv6Client}'")
             }
 

@@ -32,6 +32,8 @@ class SettingsActivity : BaseActivity() {
         private val localDns by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_LOCAL_DNS_ENABLED) }
         private val fakeDns by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_FAKE_DNS_ENABLED) }
         private val appendHttpProxy by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_APPEND_HTTP_PROXY) }
+        private val disableIpv6 by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_DISABLE_IPV6) }
+        private val preferIpv6 by lazy { findPreference<CheckBoxPreference>(AppConfig.PREF_PREFER_IPV6) }
 
         //        private val localDnsPort by lazy { findPreference<EditTextPreference>(AppConfig.PREF_LOCAL_DNS_PORT) }
         private val vpnDns by lazy { findPreference<EditTextPreference>(AppConfig.PREF_VPN_DNS) }
@@ -70,6 +72,10 @@ class SettingsActivity : BaseActivity() {
 
             localDns?.setOnPreferenceChangeListener { _, any ->
                 updateLocalDns(any as Boolean)
+                true
+            }
+            disableIpv6?.setOnPreferenceChangeListener { _, newValue ->
+                updateIpv6Settings(newValue as Boolean)
                 true
             }
 
@@ -171,6 +177,7 @@ class SettingsActivity : BaseActivity() {
 
             // Initialize mode-dependent UI states
             updateMode(MmkvManager.decodeSettingsString(AppConfig.PREF_MODE, VPN))
+            updateIpv6Settings(MmkvManager.decodeSettingsBool(AppConfig.PREF_DISABLE_IPV6, false))
 
             // Initialize mux-dependent UI states
             updateMux(MmkvManager.decodeSettingsBool(AppConfig.PREF_MUX_ENABLED, false))
@@ -197,6 +204,9 @@ class SettingsActivity : BaseActivity() {
             vpnInterfaceAddress?.isEnabled = vpn
             vpnMtu?.isEnabled = vpn
             useHevTun?.isEnabled = vpn
+            val ipv6Disabled = MmkvManager.decodeSettingsBool(AppConfig.PREF_DISABLE_IPV6, false)
+            disableIpv6?.isEnabled = vpn
+            updateIpv6Settings(ipv6Disabled)
             updateHevTunSettings(false)
             if (vpn) {
                 updateLocalDns(
@@ -218,6 +228,15 @@ class SettingsActivity : BaseActivity() {
             fakeDns?.isEnabled = enabled
 //            localDnsPort?.isEnabled = enabled
             vpnDns?.isEnabled = !enabled
+        }
+
+        private fun updateIpv6Settings(disabled: Boolean) {
+            val vpn = MmkvManager.decodeSettingsString(AppConfig.PREF_MODE, VPN) == VPN
+            preferIpv6?.isEnabled = vpn && !disabled
+            if (disabled && preferIpv6?.isChecked == true) {
+                preferIpv6?.isChecked = false
+                MmkvManager.encodeSettings(AppConfig.PREF_PREFER_IPV6, false)
+            }
         }
 
         private fun configureUpdateTask(interval: Long) {

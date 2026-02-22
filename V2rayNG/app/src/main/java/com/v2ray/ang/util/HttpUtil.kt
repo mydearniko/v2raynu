@@ -65,9 +65,10 @@ object HttpUtil {
      *
      * @param host The hostname or IP address to resolve
      * @param ipv6Preferred Whether to prefer IPv6 addresses, defaults to false
+     * @param ipv4Only Whether to return IPv4 addresses only
      * @return The resolved IP address or the original input (if it's already an IP or resolution fails)
      */
-    fun resolveHostToIP(host: String, ipv6Preferred: Boolean = false): List<String>? {
+    fun resolveHostToIP(host: String, ipv6Preferred: Boolean = false, ipv4Only: Boolean = false): List<String>? {
         try {
             // If it's already an IP address, return it as a list
             if (Utils.isPureIpAddress(host)) {
@@ -88,6 +89,16 @@ object HttpUtil {
             }
 
             val ipList = sortedAddresses.mapNotNull { it.hostAddress }
+                .let { allIps ->
+                    if (ipv4Only) {
+                        allIps.filterNot { it.contains(':') }
+                    } else {
+                        allIps
+                    }
+                }
+            if (ipList.isEmpty()) {
+                return null
+            }
 
             Log.i(AppConfig.TAG, "Resolved IPs for $host: ${ipList.joinToString()}")
 
@@ -251,4 +262,3 @@ object HttpUtil {
         }
     }
 }
-

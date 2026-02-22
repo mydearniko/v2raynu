@@ -607,6 +607,7 @@ object V2rayConfigManager {
         try {
             val hosts = mutableMapOf<String, Any>()
             val servers = ArrayList<Any>()
+            val ipv6Disabled = SettingsManager.isIpv6Disabled()
             val localDnsEnabled = MmkvManager.decodeSettingsBool(AppConfig.PREF_LOCAL_DNS_ENABLED)
             val preferReliableDnsTransport = localDnsEnabled
 
@@ -654,14 +655,21 @@ object V2rayConfigManager {
             hosts[AppConfig.GOOGLEAPIS_CN_DOMAIN] = AppConfig.GOOGLEAPIS_COM_DOMAIN
 
             // hardcode popular Android Private DNS rule to fix localhost DNS problem
-            hosts[AppConfig.DNS_ALIDNS_DOMAIN] = AppConfig.DNS_ALIDNS_ADDRESSES
-            hosts[AppConfig.DNS_CLOUDFLARE_ONE_DOMAIN] = AppConfig.DNS_CLOUDFLARE_ONE_ADDRESSES
-            hosts[AppConfig.DNS_CLOUDFLARE_DNS_COM_DOMAIN] = AppConfig.DNS_CLOUDFLARE_DNS_COM_ADDRESSES
-            hosts[AppConfig.DNS_CLOUDFLARE_DNS_DOMAIN] = AppConfig.DNS_CLOUDFLARE_DNS_ADDRESSES
+            fun dnsHostAddresses(addresses: List<String>): List<String> {
+                return if (ipv6Disabled) {
+                    addresses.filterNot { it.contains(':') }
+                } else {
+                    addresses
+                }
+            }
+            hosts[AppConfig.DNS_ALIDNS_DOMAIN] = dnsHostAddresses(AppConfig.DNS_ALIDNS_ADDRESSES)
+            hosts[AppConfig.DNS_CLOUDFLARE_ONE_DOMAIN] = dnsHostAddresses(AppConfig.DNS_CLOUDFLARE_ONE_ADDRESSES)
+            hosts[AppConfig.DNS_CLOUDFLARE_DNS_COM_DOMAIN] = dnsHostAddresses(AppConfig.DNS_CLOUDFLARE_DNS_COM_ADDRESSES)
+            hosts[AppConfig.DNS_CLOUDFLARE_DNS_DOMAIN] = dnsHostAddresses(AppConfig.DNS_CLOUDFLARE_DNS_ADDRESSES)
             hosts[AppConfig.DNS_DNSPOD_DOMAIN] = AppConfig.DNS_DNSPOD_ADDRESSES
-            hosts[AppConfig.DNS_GOOGLE_DOMAIN] = AppConfig.DNS_GOOGLE_ADDRESSES
-            hosts[AppConfig.DNS_QUAD9_DOMAIN] = AppConfig.DNS_QUAD9_ADDRESSES
-            hosts[AppConfig.DNS_YANDEX_DOMAIN] = AppConfig.DNS_YANDEX_ADDRESSES
+            hosts[AppConfig.DNS_GOOGLE_DOMAIN] = dnsHostAddresses(AppConfig.DNS_GOOGLE_ADDRESSES)
+            hosts[AppConfig.DNS_QUAD9_DOMAIN] = dnsHostAddresses(AppConfig.DNS_QUAD9_ADDRESSES)
+            hosts[AppConfig.DNS_YANDEX_DOMAIN] = dnsHostAddresses(AppConfig.DNS_YANDEX_ADDRESSES)
 
             //User DNS hosts
             try {
@@ -694,6 +702,7 @@ object V2rayConfigManager {
             v2rayConfig.dns = V2rayConfig.DnsBean(
                 servers = servers,
                 hosts = hosts,
+                queryStrategy = if (ipv6Disabled) "UseIPv4" else null,
                 tag = AppConfig.TAG_DNS
             )
 
@@ -859,7 +868,7 @@ object V2rayConfigManager {
                 } else {
                     outbound.settings?.address as List<*>
                 }
-                if (MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6) != true) {
+                if (!SettingsManager.isIpv6Enabled()) {
                     localTunAddr = listOf(localTunAddr.first())
                 }
                 outbound.settings?.address = localTunAddr
@@ -977,7 +986,11 @@ object V2rayConfigManager {
             if (v2rayConfig.routing.domainStrategy == "IPIfNonMatch") {
                 v2rayConfig.routing.rules.add(
                     RulesBean(
-                        ip = arrayListOf("0.0.0.0/0", "::/0"),
+                        ip = if (SettingsManager.isIpv6Disabled()) {
+                            arrayListOf("0.0.0.0/0")
+                        } else {
+                            arrayListOf("0.0.0.0/0", "::/0")
+                        },
                         balancerTag = AppConfig.TAG_BALANCER,
                     )
                 )
@@ -1079,7 +1092,8 @@ object V2rayConfigManager {
         val proxyOutboundList = v2rayConfig.getAllProxyOutbound()
         val dns = v2rayConfig.dns ?: return
         val newHosts = dns.hosts?.toMutableMap() ?: mutableMapOf()
-        val preferIpv6 = MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6) == true
+        val preferIpv6 = SettingsManager.isIpv6Enabled()
+        val ipv4Only = SettingsManager.isIpv6Disabled()
         val lookupBudget = when {
             // Large policy groups can contain thousands of outbounds. Synchronous DNS
             // pre-resolve here would block service startup for several seconds.
@@ -1102,7 +1116,7 @@ object V2rayConfigManager {
                 continue
             }
 
-            val resolvedIps = resolveHostWithCache(domain, preferIpv6)
+            val resolvedIps = resolveHostWithCache(domain, preferIpv6, ipv4Only)
             if (resolvedIps.isNullOrEmpty()) continue
             lookupCount++
 
@@ -1125,15 +1139,15 @@ object V2rayConfigManager {
         )
     }
 
-    private fun resolveHostWithCache(domain: String, preferIpv6: Boolean): List<String>? {
+    private fun resolveHostWithCache(domain: String, preferIpv6: Boolean, ipv4Only: Boolean): List<String>? {
         val now = System.currentTimeMillis()
-        val cacheKey = if (preferIpv6) "6:$domain" else "4:$domain"
+        val cacheKey = if (ipv4Only) "4only:$domain" else if (preferIpv6) "6:$domain" else "4:$domain"
         val cached = dnsResolveCache[cacheKey]
         if (cached != null && now - cached.cachedAtMillis <= DNS_CACHE_TTL_MS) {
             return cached.ips
         }
 
-        val resolvedIps = HttpUtil.resolveHostToIP(domain, preferIpv6)
+        val resolvedIps = HttpUtil.resolveHostToIP(domain, preferIpv6, ipv4Only)
         if (resolvedIps.isNullOrEmpty()) {
             dnsResolveCache.remove(cacheKey)
             return null

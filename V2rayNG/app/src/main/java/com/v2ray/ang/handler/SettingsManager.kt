@@ -287,8 +287,10 @@ object SettingsManager {
      */
     fun getDomesticDnsServers(): List<String> {
         val domesticDns = MmkvManager.decodeSettingsString(AppConfig.PREF_DOMESTIC_DNS) ?: AppConfig.DNS_DIRECT
-        val ret = parseDnsEntries(domesticDns)
+        val ret = filterOutIpv6AddressesIfDisabled(
+            parseDnsEntries(domesticDns)
             .filter { Utils.isPureIpAddress(it) || Utils.isCoreDNSAddress(it) }
+        )
         if (ret.isEmpty()) {
             return listOf(AppConfig.DNS_DIRECT)
         }
@@ -301,8 +303,10 @@ object SettingsManager {
      */
     fun getRemoteDnsServers(): List<String> {
         val remoteDns = MmkvManager.decodeSettingsString(AppConfig.PREF_REMOTE_DNS) ?: AppConfig.DNS_PROXY
-        val ret = parseDnsEntries(remoteDns)
+        val ret = filterOutIpv6AddressesIfDisabled(
+            parseDnsEntries(remoteDns)
             .filter { Utils.isPureIpAddress(it) || Utils.isCoreDNSAddress(it) }
+        )
         if (ret.isEmpty()) {
             return listOf(AppConfig.DNS_PROXY)
         }
@@ -315,8 +319,10 @@ object SettingsManager {
      */
     fun getVpnDnsServers(): List<String> {
         val vpnDns = MmkvManager.decodeSettingsString(AppConfig.PREF_VPN_DNS) ?: AppConfig.DNS_VPN
-        val ret = parseDnsEntries(vpnDns)
+        val ret = filterOutIpv6AddressesIfDisabled(
+            parseDnsEntries(vpnDns)
             .filter { Utils.isPureIpAddress(it) }
+        )
         if (ret.isEmpty()) {
             return listOf(AppConfig.DNS_VPN)
         }
@@ -332,6 +338,21 @@ object SettingsManager {
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
+    }
+
+    fun isIpv6Disabled(): Boolean {
+        return MmkvManager.decodeSettingsBool(AppConfig.PREF_DISABLE_IPV6, false) == true
+    }
+
+    fun isIpv6Enabled(): Boolean {
+        return !isIpv6Disabled() && MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6) == true
+    }
+
+    private fun filterOutIpv6AddressesIfDisabled(entries: List<String>): List<String> {
+        if (!isIpv6Disabled()) return entries
+        return entries.filterNot { entry ->
+            Utils.isPureIpAddress(entry) && entry.contains(':')
+        }
     }
 
     /**
@@ -497,6 +518,7 @@ object SettingsManager {
     fun ensureDefaultSettings() {
         // Write defaults in the exact order requested by the user
         ensureDefaultValue(AppConfig.PREF_MODE, AppConfig.VPN)
+        ensureDefaultValue(AppConfig.PREF_DISABLE_IPV6, "false")
         ensureDefaultValue(AppConfig.PREF_VPN_DNS, AppConfig.DNS_VPN)
         ensureDefaultValue(AppConfig.PREF_VPN_MTU, AppConfig.VPN_MTU.toString())
         ensureDefaultValue(AppConfig.SUBSCRIPTION_AUTO_UPDATE_INTERVAL, AppConfig.SUBSCRIPTION_DEFAULT_UPDATE_INTERVAL)
