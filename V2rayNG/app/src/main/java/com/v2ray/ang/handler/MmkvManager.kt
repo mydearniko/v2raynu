@@ -13,6 +13,7 @@ import com.v2ray.ang.dto.SubscriptionItem
 import com.v2ray.ang.dto.WebDavConfig
 import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.Utils
+import java.util.concurrent.ConcurrentHashMap
 
 object MmkvManager {
 
@@ -39,6 +40,10 @@ object MmkvManager {
     private val subStorage by lazy { MMKV.mmkvWithID(ID_SUB, MMKV.MULTI_PROCESS_MODE) }
     private val assetStorage by lazy { MMKV.mmkvWithID(ID_ASSET, MMKV.MULTI_PROCESS_MODE) }
     private val settingsStorage by lazy { MMKV.mmkvWithID(ID_SETTING, MMKV.MULTI_PROCESS_MODE) }
+    private val serverConfigCache = ConcurrentHashMap<String, ProfileItem>()
+    private val serverListCacheLock = Any()
+    @Volatile
+    private var serverListCache: MutableList<String>? = null
 
     //endregion
 
@@ -68,7 +73,11 @@ object MmkvManager {
      * @param serverList The list of server GUIDs.
      */
     fun encodeServerList(serverList: MutableList<String>) {
-        mainStorage.encode(KEY_ANG_CONFIGS, JsonUtil.toJson(serverList))
+        val snapshot = serverList.toMutableList()
+        mainStorage.encode(KEY_ANG_CONFIGS, JsonUtil.toJson(snapshot))
+        synchronized(serverListCacheLock) {
+            serverListCache = snapshot.toMutableList()
+        }
     }
 
     /**
@@ -77,12 +86,19 @@ object MmkvManager {
      * @return The list of server GUIDs.
      */
     fun decodeServerList(): MutableList<String> {
+        synchronized(serverListCacheLock) {
+            serverListCache?.let { return it.toMutableList() }
+        }
         val json = mainStorage.decodeString(KEY_ANG_CONFIGS)
-        return if (json.isNullOrBlank()) {
+        val list = if (json.isNullOrBlank()) {
             mutableListOf()
         } else {
             JsonUtil.fromJson(json, Array<String>::class.java)?.toMutableList() ?: mutableListOf()
         }
+        synchronized(serverListCacheLock) {
+            serverListCache = list.toMutableList()
+        }
+        return list
     }
 
     /**
@@ -95,11 +111,67 @@ object MmkvManager {
         if (guid.isBlank()) {
             return null
         }
+        serverConfigCache[guid]?.let { return it.copy() }
+
         val json = profileFullStorage.decodeString(guid)
         if (json.isNullOrBlank()) {
             return null
         }
-        return JsonUtil.fromJson(json, ProfileItem::class.java)
+        val profile = JsonUtil.fromJson(json, ProfileItem::class.java) ?: return null
+        serverConfigCache[guid] = profile
+        return profile.copy()
+    }
+
+    /**
+     * Decodes only the server address for a profile.
+     *
+     * This avoids creating a defensive copy when callers only need the host/IP value.
+     *
+     * @param guid The server GUID.
+     * @return The server address, or null if unavailable.
+     */
+    fun decodeServerAddress(guid: String): String? {
+        if (guid.isBlank()) {
+            return null
+        }
+        serverConfigCache[guid]?.let { return it.server }
+
+        val json = profileFullStorage.decodeString(guid) ?: return null
+        val profile = JsonUtil.fromJson(json, ProfileItem::class.java) ?: return null
+        serverConfigCache[guid] = profile
+        return profile.server
+    }
+
+    /**
+     * Extracts server addresses for all given GUIDs in bulk using lightweight
+     * JSON parsing (org.json) instead of full Gson reflection.
+     *
+     * This is dramatically faster than calling [decodeServerAddress] per GUID
+     * when the config cache is cold (e.g. thousands of profiles).
+     *
+     * @param guids The list of server GUIDs.
+     * @return A map of GUID to server address (null values omitted).
+     */
+    fun decodeServerAddressesBulk(guids: List<String>): Map<String, String> {
+        val result = HashMap<String, String>(guids.size)
+        for (guid in guids) {
+            if (guid.isBlank()) continue
+            // Fast path: already cached from normal usage
+            serverConfigCache[guid]?.server?.let {
+                result[guid] = it
+                continue
+            }
+            // Lightweight extraction without full deserialization
+            val json = profileFullStorage.decodeString(guid) ?: continue
+            try {
+                val server = org.json.JSONObject(json).optString("server", null)
+                if (!server.isNullOrBlank()) {
+                    result[guid] = server
+                }
+            } catch (_: Exception) {
+            }
+        }
+        return result
     }
 
 //    fun decodeProfileConfig(guid: String): ProfileLiteItem? {
@@ -122,7 +194,9 @@ object MmkvManager {
      */
     fun encodeServerConfig(guid: String, config: ProfileItem): String {
         val key = guid.ifBlank { Utils.getUuid() }
-        profileFullStorage.encode(key, JsonUtil.toJson(config))
+        val snapshot = config.copy()
+        profileFullStorage.encode(key, JsonUtil.toJson(snapshot))
+        serverConfigCache[key] = snapshot
         val serverList = decodeServerList()
         if (!serverList.contains(key)) {
             serverList.add(0, key)
@@ -158,8 +232,44 @@ object MmkvManager {
         serverList.remove(guid)
         encodeServerList(serverList)
         profileFullStorage.remove(guid)
+        serverConfigCache.remove(guid)
         //profileStorage.remove(guid)
         serverAffStorage.remove(guid)
+    }
+
+    /**
+     * Removes multiple server configurations in one storage pass.
+     *
+     * @param guidList The server GUID list.
+     * @return The number of removed servers.
+     */
+    fun removeServers(guidList: Collection<String>): Int {
+        if (guidList.isEmpty()) {
+            return 0
+        }
+
+        val removeSet = guidList.asSequence()
+            .filter { it.isNotBlank() }
+            .toSet()
+        if (removeSet.isEmpty()) {
+            return 0
+        }
+
+        if (getSelectServer()?.let { removeSet.contains(it) } == true) {
+            mainStorage.remove(KEY_SELECTED_SERVER)
+        }
+
+        val serverList = decodeServerList()
+        val before = serverList.size
+        serverList.removeAll(removeSet)
+        encodeServerList(serverList)
+
+        removeSet.forEach { guid ->
+            profileFullStorage.remove(guid)
+            serverConfigCache.remove(guid)
+            serverAffStorage.remove(guid)
+        }
+        return before - serverList.size
     }
 
     /**
@@ -171,13 +281,46 @@ object MmkvManager {
         if (subid.isBlank()) {
             return
         }
-        profileFullStorage.allKeys()?.forEach { key ->
-            decodeServerConfig(key)?.let { config ->
-                if (config.subscriptionId == subid) {
-                    removeServer(key)
-                }
-            }
+        val guidsToRemove = profileFullStorage.allKeys()?.filter { key ->
+            decodeServerConfig(key)?.subscriptionId == subid
+        } ?: return
+        if (guidsToRemove.isNotEmpty()) {
+            removeServers(guidsToRemove)
         }
+    }
+
+    /**
+     * Encodes multiple server configurations in a single batch, updating the
+     * server list only once at the end instead of per-server.
+     *
+     * @param configs The list of server configurations to encode.
+     * @return The list of generated server GUIDs.
+     */
+    fun encodeServerConfigs(configs: List<ProfileItem>): List<String> {
+        if (configs.isEmpty()) return emptyList()
+
+        val keys = mutableListOf<String>()
+        for (config in configs) {
+            val key = Utils.getUuid()
+            val snapshot = config.copy()
+            profileFullStorage.encode(key, JsonUtil.toJson(snapshot))
+            serverConfigCache[key] = snapshot
+            keys.add(key)
+        }
+
+        val serverList = decodeServerList()
+        val existingSet = serverList.toHashSet()
+        val newKeys = keys.filter { !existingSet.contains(it) }
+        if (newKeys.isNotEmpty()) {
+            serverList.addAll(0, newKeys)
+            encodeServerList(serverList)
+        }
+
+        if (getSelectServer().isNullOrBlank() && keys.isNotEmpty()) {
+            mainStorage.encode(KEY_SELECTED_SERVER, keys.first())
+        }
+
+        return keys
     }
 
     /**
@@ -267,6 +410,10 @@ object MmkvManager {
         val count = profileFullStorage.allKeys()?.count() ?: 0
         mainStorage.clearAll()
         profileFullStorage.clearAll()
+        serverConfigCache.clear()
+        synchronized(serverListCacheLock) {
+            serverListCache = mutableListOf()
+        }
         //profileStorage.clearAll()
         serverAffStorage.clearAll()
         return count

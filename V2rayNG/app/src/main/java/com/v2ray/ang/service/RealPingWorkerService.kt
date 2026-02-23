@@ -44,6 +44,7 @@ class RealPingWorkerService(
         private const val STARTUP_BARRIER_TIMEOUT_SECONDS = 2L
         private const val NETWORK_WARMUP_WORKER_LIMIT = 8
         private const val WARMUP_CONFIG_SCAN_LIMIT = 64
+        private const val MIN_SUCCESS_SAMPLES_FOR_STABLE_RESULT = 2
     }
 
     private val job = SupervisorJob()
@@ -65,7 +66,6 @@ class RealPingWorkerService(
     private val runningCount = AtomicInteger(0)
     private val remainingCount = AtomicInteger(0)
     private val completedServerCount = AtomicInteger(0)
-    private val completedSampleCount = AtomicInteger(0)
     private val startedAtMillis = AtomicLong(0L)
     private val speedtestConfigCache = ConcurrentHashMap<String, CachedSpeedtestConfig>()
     @Volatile
@@ -89,12 +89,12 @@ class RealPingWorkerService(
         }
 
         val timeoutMillis = SettingsManager.getRealPingAttemptTimeoutMillis()
-        val testUrl = SettingsManager.getDelayTestUrl()
+        val primaryTestUrl = SettingsManager.getDelayTestUrl()
+        val alternateTestUrl = SettingsManager.getDelayTestUrl(true)
         V2RayNativeManager.setRealPingAttemptTimeoutMillis(timeoutMillis.toLong())
         startedAtMillis.set(System.currentTimeMillis())
         remainingCount.set(guids.size)
         completedServerCount.set(0)
-        completedSampleCount.set(0)
         notifyProgress()
 
         heartbeatJob = scope.launch {
@@ -122,7 +122,7 @@ class RealPingWorkerService(
                     }
 
                     if (workerIndex < warmupWorkers) {
-                        prewarmWorker(warmupConfig, testUrl)
+                        prewarmWorker(warmupConfig, primaryTestUrl)
                     }
 
                     for (guid in queue) {
@@ -132,7 +132,7 @@ class RealPingWorkerService(
                         runningCount.incrementAndGet()
                         notifyProgress()
                         try {
-                            val samples = startRealPing(guid, testUrl)
+                            val samples = startRealPing(guid, primaryTestUrl, alternateTestUrl)
                             if (isActive && job.isActive && shouldRun()) {
                                 MessageUtil.sendMsg2UI(
                                     context,
@@ -205,7 +205,7 @@ class RealPingWorkerService(
         }
     }
 
-    private fun startRealPing(guid: String, testUrl: String): LongArray {
+    private fun startRealPing(guid: String, primaryUrl: String, altUrl: String): LongArray {
         val retFailure = LongArray(MEASUREMENTS_PER_SERVER) { -1L }
         if (!shouldRun() || !job.isActive) {
             return retFailure
@@ -214,38 +214,86 @@ class RealPingWorkerService(
         try {
             val configResult = getSpeedtestConfig(guid)
             if (!configResult.status) {
-                completedSampleCount.addAndGet(MEASUREMENTS_PER_SERVER)
                 notifyProgress()
                 return retFailure
             }
 
-            // Fast path: one native startup for the whole sample series.
-            val nativeSeries = V2RayNativeManager.measureOutboundDelaySeries(
+            val primarySamples = measureSamples(
                 config = configResult.content,
-                testUrl = testUrl,
-                samples = MEASUREMENTS_PER_SERVER
+                testUrl = primaryUrl
             )
-            if (nativeSeries != null && nativeSeries.isNotEmpty()) {
-                completedSampleCount.addAndGet(nativeSeries.size.coerceAtMost(MEASUREMENTS_PER_SERVER))
-                notifyProgress()
-                return nativeSeries.copyOf(MEASUREMENTS_PER_SERVER)
+            if (!shouldRun() || !job.isActive) {
+                return retFailure
+            }
+            if (!shouldTryAlternateUrl(primarySamples, primaryUrl, altUrl)) {
+                return primarySamples
             }
 
-            // Backward-compatible path for older native bindings.
-            val results = LongArray(MEASUREMENTS_PER_SERVER) { -1L }
-            for (i in 0 until MEASUREMENTS_PER_SERVER) {
-                if (!shouldRun() || !job.isActive) {
-                    break
-                }
-                val result = V2RayNativeManager.measureOutboundDelay(configResult.content, testUrl)
-                completedSampleCount.incrementAndGet()
-                notifyProgress()
-                results[i] = result
-            }
-            return results
+            val fallbackSamples = measureSamples(
+                config = configResult.content,
+                testUrl = altUrl
+            )
+            return mergePrimaryAndFallbackSamples(primarySamples, fallbackSamples)
         } finally {
             speedtestConfigCache.remove(guid)
         }
+    }
+
+    private fun measureSamples(
+        config: String,
+        testUrl: String
+    ): LongArray {
+        // Fast path: one native startup for the whole sample series.
+        val nativeSeries = V2RayNativeManager.measureOutboundDelaySeries(
+            config = config,
+            testUrl = testUrl,
+            samples = MEASUREMENTS_PER_SERVER
+        )
+        if (nativeSeries != null && nativeSeries.isNotEmpty()) {
+            return nativeSeries.copyOf(MEASUREMENTS_PER_SERVER)
+        }
+
+        // Backward-compatible path for older native bindings.
+        val results = LongArray(MEASUREMENTS_PER_SERVER) { -1L }
+        for (i in 0 until MEASUREMENTS_PER_SERVER) {
+            if (!shouldRun() || !job.isActive) {
+                break
+            }
+            val result = V2RayNativeManager.measureOutboundDelay(config, testUrl)
+            results[i] = result
+        }
+        return results
+    }
+
+    private fun shouldTryAlternateUrl(primarySamples: LongArray, primaryUrl: String, altUrl: String): Boolean {
+        if (altUrl.isBlank()) {
+            return false
+        }
+        if (altUrl.equals(primaryUrl, ignoreCase = true)) {
+            return false
+        }
+        return primarySamples.count { it >= 0L } < MIN_SUCCESS_SAMPLES_FOR_STABLE_RESULT
+    }
+
+    private fun mergePrimaryAndFallbackSamples(primarySamples: LongArray, fallbackSamples: LongArray): LongArray {
+        val merged = primarySamples.copyOf(MEASUREMENTS_PER_SERVER)
+        val fallbackSuccesses = fallbackSamples.filter { it >= 0L }
+        if (fallbackSuccesses.isEmpty()) {
+            return merged
+        }
+
+        var fallbackIndex = 0
+        for (index in merged.indices) {
+            if (merged[index] >= 0L) {
+                continue
+            }
+            if (fallbackIndex >= fallbackSuccesses.size) {
+                break
+            }
+            merged[index] = fallbackSuccesses[fallbackIndex]
+            fallbackIndex++
+        }
+        return merged
     }
 
     private fun prepareWarmupConfig(): String? {
@@ -289,17 +337,12 @@ class RealPingWorkerService(
             return
         }
         val totalServers = guids.size.coerceAtLeast(1)
-        val totalSamples = totalServers * MEASUREMENTS_PER_SERVER
         val elapsedSeconds = ((System.currentTimeMillis() - startedAtMillis.get()) / 1000L).coerceAtLeast(0L)
         val content = buildString(96) {
             append(completedServerCount.get().coerceIn(0, totalServers))
             append('/')
             append(totalServers)
             append(" servers / ")
-            append(completedSampleCount.get().coerceIn(0, totalSamples))
-            append('/')
-            append(totalSamples)
-            append(" attempts / ")
             append(runningCount.get().coerceAtLeast(0))
             append(" active / ")
             append(remainingCount.get().coerceAtLeast(0))

@@ -19,10 +19,13 @@ import com.v2ray.ang.service.V2RayVpnService
 import com.v2ray.ang.util.MessageUtil
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import libv2ray.CoreCallbackHandler
 import libv2ray.CoreController
 import java.lang.ref.SoftReference
@@ -230,6 +233,8 @@ object V2RayServiceManager {
      *
      * New requests cancel previous in-flight requests; stale results are dropped.
      */
+    private const val PARALLEL_DELAY_ATTEMPTS = 3
+
     private fun measureV2rayDelay() {
         if (coreController.isRunning == false) {
             return
@@ -239,35 +244,64 @@ object V2RayServiceManager {
         delayMeasureJob?.cancel()
         delayMeasureJob = CoroutineScope(Dispatchers.IO).launch {
             val service = getService() ?: return@launch
-            var time = -1L
-            var errorStr = ""
+            // Use applicationContext for correct app-configured locale
+            val ctx = service.applicationContext
             var details: String? = null
 
             fun isCurrentRequestActive(): Boolean {
                 return isActive && generation == delayMeasureGeneration.get()
             }
 
-            try {
-                time = coreController.measureDelay(SettingsManager.getDelayTestUrl())
-            } catch (e: Exception) {
-                Log.e(AppConfig.TAG, "Failed to measure delay with primary URL", e)
-                errorStr = e.message?.substringAfter("\":") ?: "empty message"
+            // Fire 6 parallel delay requests: 3 primary URL + 3 alt URL
+            val primaryUrl = SettingsManager.getDelayTestUrl()
+            val altUrl = SettingsManager.getDelayTestUrl(true)
+            val pending = mutableListOf<Deferred<Long>>()
+            repeat(PARALLEL_DELAY_ATTEMPTS) {
+                pending.add(async(Dispatchers.IO) {
+                    try {
+                        coreController.measureDelay(primaryUrl)
+                    } catch (e: Exception) {
+                        Log.e(AppConfig.TAG, "Parallel delay check (primary) failed", e)
+                        -1L
+                    }
+                })
+                pending.add(async(Dispatchers.IO) {
+                    try {
+                        coreController.measureDelay(altUrl)
+                    } catch (e: Exception) {
+                        Log.e(AppConfig.TAG, "Parallel delay check (alt) failed", e)
+                        -1L
+                    }
+                })
             }
-            if (!isCurrentRequestActive()) return@launch
-            if (time == -1L) {
-                try {
-                    time = coreController.measureDelay(SettingsManager.getDelayTestUrl(true))
-                } catch (e: Exception) {
-                    Log.e(AppConfig.TAG, "Failed to measure delay with alternative URL", e)
-                    errorStr = e.message?.substringAfter("\":") ?: "empty message"
+
+            // Take the first successful (>=0) result
+            var time = -1L
+            var errorStr = ""
+            while (pending.isNotEmpty() && time < 0L) {
+                if (!isCurrentRequestActive()) {
+                    pending.forEach { it.cancel() }
+                    return@launch
+                }
+                val (finished, value) = select<Pair<Deferred<Long>, Long>> {
+                    pending.forEach { d ->
+                        d.onAwait { v -> d to v }
+                    }
+                }
+                pending.remove(finished)
+                if (value >= 0L) {
+                    time = value
                 }
             }
+            // Cancel remaining requests once we have a result
+            pending.forEach { it.cancel() }
+
             if (!isCurrentRequestActive()) return@launch
 
             val result = if (time >= 0) {
-                service.getString(R.string.connection_test_available, time)
+                ctx.getString(R.string.connection_test_available, time)
             } else {
-                service.getString(R.string.connection_test_error, errorStr)
+                ctx.getString(R.string.connection_test_error, errorStr)
             }
 
             // Only fetch IP/Geo details if the delay test was successful

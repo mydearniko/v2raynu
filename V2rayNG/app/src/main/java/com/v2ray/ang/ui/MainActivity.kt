@@ -46,7 +46,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelectedListener {
     companion object {
-        private const val SUBSCRIPTION_UPDATE_TIMEOUT_MS = 180_000L
+        private const val SUBSCRIPTION_UPDATE_TIMEOUT_MS = 30_000L
     }
 
     private val binding by lazy {
@@ -145,6 +145,16 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
         binding.viewPager.setCurrentItem(targetIndex, false)
 
         binding.tabGroup.isVisible = groups.size > 1
+    }
+
+    private fun syncActionScopeToSelectedGroup() {
+        val selectedGroupId = groupPagerAdapter.groups
+            .getOrNull(binding.viewPager.currentItem)
+            ?.id
+            ?: return
+        if (mainViewModel.subscriptionId != selectedGroupId) {
+            mainViewModel.subscriptionIdChanged(selectedGroupId)
+        }
     }
 
     private fun handleFabAction() {
@@ -357,19 +367,22 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
         }
 
         R.id.export_all -> {
+            syncActionScopeToSelectedGroup()
             exportAll()
             true
         }
 
         R.id.ping_all -> {
-            toast(getString(R.string.connection_test_testing_count, mainViewModel.serversCache.count()))
-            mainViewModel.testAllTcping()
+            syncActionScopeToSelectedGroup()
+            val targetCount = mainViewModel.testAllTcping()
+            toast(getString(R.string.connection_test_testing_count, targetCount))
             true
         }
 
         R.id.real_ping_all -> {
-            toast(getString(R.string.connection_test_testing_count, mainViewModel.serversCache.count()))
-            mainViewModel.testAllRealPing()
+            syncActionScopeToSelectedGroup()
+            val targetCount = mainViewModel.testAllRealPing()
+            toast(getString(R.string.connection_test_testing_count, targetCount))
             true
         }
 
@@ -379,26 +392,31 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
         }
 
         R.id.del_all_config -> {
+            syncActionScopeToSelectedGroup()
             delAllConfig()
             true
         }
 
         R.id.del_duplicate_config -> {
+            syncActionScopeToSelectedGroup()
             delDuplicateConfig()
             true
         }
 
         R.id.del_invalid_config -> {
+            syncActionScopeToSelectedGroup()
             delInvalidConfig()
             true
         }
 
         R.id.sort_by_test_results -> {
+            syncActionScopeToSelectedGroup()
             sortByTestResults()
             true
         }
 
         R.id.sub_update -> {
+            syncActionScopeToSelectedGroup()
             importConfigViaSub()
             true
         }

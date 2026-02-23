@@ -34,14 +34,18 @@ import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.MessageUtil
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.withContext
 import libv2ray.CoreCallbackHandler
 import java.util.Collections
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -54,6 +58,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val updateListAction by lazy { MutableLiveData<Int>() }
     val updateTestResultAction by lazy { MutableLiveData<String>() }
     private val tcpingTestScope by lazy { CoroutineScope(Dispatchers.IO) }
+    @Volatile
+    private var testScopeSubscriptionId: String? = null
+    @Volatile
+    private var testScopeKeywordFilter: String? = null
     private var isDelayCheckPending = false
     private var delayCheckTimeoutJob: Job? = null
     private var delayCheckRequestedAtMs = 0L
@@ -218,6 +226,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * Returns a stable snapshot of the currently visible servers.
+     *
+     * Scope always follows the active subscription tab + keyword filter.
+     */
+    @Synchronized
+    private fun getScopedServerSnapshot(): List<ServersCache> {
+        serverList = MmkvManager.decodeServerList()
+        updateCache()
+        return serversCache.toList()
+    }
+
+    /**
+     * Returns a stable snapshot of GUIDs in the current action scope.
+     */
+    private fun getScopedGuidSnapshot(): List<String> {
+        return getScopedServerSnapshot().map { it.guid }
+    }
+
     private fun matchesKeyword(profile: com.v2ray.ang.dto.ProfileItem, keyword: String): Boolean {
         if (keyword.isEmpty()) return true
 
@@ -235,6 +262,31 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ?.lowercase()
                 ?.contains(keyword) == true
         }
+    }
+
+    private fun normalizeServerAddressForDuplicateCheck(server: String?): String? {
+        var normalized = server?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+
+        if (normalized.startsWith("[") && normalized.contains("]")) {
+            normalized = normalized.substring(1, normalized.indexOf(']'))
+        } else if (normalized.count { it == ':' } == 1 && normalized.contains('.')) {
+            val colonIndex = normalized.lastIndexOf(':')
+            val portPart = normalized.substring(colonIndex + 1)
+            if (portPart.all { it.isDigit() }) {
+                normalized = normalized.substring(0, colonIndex)
+            }
+        }
+
+        normalized = normalized.trim()
+        if (normalized.isEmpty()) {
+            return null
+        }
+
+        if (normalized.startsWith("::ffff:", ignoreCase = true) && normalized.contains('.')) {
+            normalized = normalized.substring(7)
+        }
+
+        return normalized.lowercase(Locale.ROOT)
     }
 
     /**
@@ -255,12 +307,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * @return The number of exported servers.
      */
     fun exportAllServer(): Int {
-        val serverListCopy =
-            if (subscriptionId.isEmpty() && keywordFilter.isEmpty()) {
-                serverList
-            } else {
-                serversCache.map { it.guid }.toList()
-            }
+        val serverListCopy = getScopedGuidSnapshot()
 
         val ret = AngConfigManager.shareNonCustomConfigsToClipboard(
             getApplication<AngApplication>(),
@@ -272,12 +319,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * Tests the TCP ping for all servers.
      */
-    fun testAllTcping() {
+    fun testAllTcping(): Int {
         tcpingTestScope.coroutineContext[Job]?.cancelChildren()
         SpeedtestManager.closeAllTcpSockets()
-        MmkvManager.clearAllTestDelayResults(serversCache.map { it.guid }.toList())
+        val serversCopy = getScopedServerSnapshot()
+        val targetGuids = serversCopy.map { it.guid }
+        MmkvManager.clearAllTestDelayResults(targetGuids)
 
-        val serversCopy = serversCache.toList()
         for (item in serversCopy) {
             item.profile.let { outbound ->
                 val serverAddress = outbound.server
@@ -293,26 +341,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
         }
+        return serversCopy.size
     }
 
     /**
      * Tests the real ping for all servers.
      */
-    fun testAllRealPing() {
+    fun testAllRealPing(): Int {
         // Do not send MSG_MEASURE_CONFIG_CANCEL here.
         // V2RayTestService already cancels the previous batch when a new MSG_MEASURE_CONFIG arrives.
         updateListAction.value = -1
 
-        val guids = ArrayList<String>(serversCache.map { it.guid })
+        val guids = ArrayList(getScopedGuidSnapshot())
         if (guids.isEmpty()) {
-            return
+            return 0
         }
+
+        // Save the scope that was active when the test started so onTestsFinished()
+        // operates on the same group even if the user switches tabs during the test.
+        testScopeSubscriptionId = subscriptionId
+        testScopeKeywordFilter = keywordFilter
 
         viewModelScope.launch(Dispatchers.Default) {
             MmkvManager.clearAllTestDelayResults(guids)
             val batchId = RealPingBatchStore.createBatch(guids)
             MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG, batchId)
         }
+        return guids.size
     }
 
     /**
@@ -325,6 +380,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         startServiceBackedDelayCheck(showTestingState = false)
+    }
+
+    private companion object {
+        private const val PARALLEL_DELAY_ATTEMPTS = 3
     }
 
     private fun testCurrentServerDelayWithoutService() {
@@ -352,16 +411,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     return@launch
                 }
 
-                var delayMillis = V2RayNativeManager.measureOutboundDelay(
-                    configResult.content,
-                    SettingsManager.getDelayTestUrl()
-                )
-                if (delayMillis < 0L && generation == standaloneDelayGeneration.get()) {
-                    delayMillis = V2RayNativeManager.measureOutboundDelay(
-                        configResult.content,
-                        SettingsManager.getDelayTestUrl(true)
-                    )
+                // Fire 6 parallel delay requests: 3 primary URL + 3 alt URL
+                val primaryUrl = SettingsManager.getDelayTestUrl()
+                val altUrl = SettingsManager.getDelayTestUrl(true)
+                val config = configResult.content
+                val pending = mutableListOf<Deferred<Long>>()
+                repeat(PARALLEL_DELAY_ATTEMPTS) {
+                    pending.add(async(Dispatchers.IO) {
+                        V2RayNativeManager.measureOutboundDelay(config, primaryUrl)
+                    })
+                    pending.add(async(Dispatchers.IO) {
+                        V2RayNativeManager.measureOutboundDelay(config, altUrl)
+                    })
                 }
+
+                // Take the first successful (>=0) result
+                var delayMillis = -1L
+                while (pending.isNotEmpty() && delayMillis < 0L) {
+                    if (generation != standaloneDelayGeneration.get()) {
+                        pending.forEach { it.cancel() }
+                        return@launch
+                    }
+                    val (finished, value) = select<Pair<Deferred<Long>, Long>> {
+                        pending.forEach { d ->
+                            d.onAwait { v -> d to v }
+                        }
+                    }
+                    pending.remove(finished)
+                    if (value >= 0L) {
+                        delayMillis = value
+                    }
+                }
+                // Cancel remaining requests once we have a result
+                pending.forEach { it.cancel() }
 
                 if (generation != standaloneDelayGeneration.get()) {
                     return@launch
@@ -553,28 +635,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
-     * Removes duplicate servers.
+     * Removes duplicate servers by address (ignoring port/protocol/settings).
      * @return The number of removed servers.
      */
     fun removeDuplicateServer(): Int {
-        val serversCacheCopy = serversCache.toList().toMutableList()
+        val scopedServers = getScopedServerSnapshot()
         val deleteServer = mutableListOf<String>()
-        serversCacheCopy.forEachIndexed { index, sc ->
-            val profile = sc.profile
-            serversCacheCopy.forEachIndexed { index2, sc2 ->
-                if (index2 > index) {
-                    val profile2 = sc2.profile
-                    if (profile == profile2 && !deleteServer.contains(sc2.guid)) {
-                        deleteServer.add(sc2.guid)
-                    }
-                }
+        val seenAddress = hashSetOf<String>()
+
+        for (item in scopedServers) {
+            val guid = item.guid
+            val addressKey = normalizeServerAddressForDuplicateCheck(
+                item.profile.server
+            ) ?: continue
+            if (!seenAddress.add(addressKey)) {
+                deleteServer.add(guid)
             }
         }
-        for (it in deleteServer) {
-            MmkvManager.removeServer(it)
-        }
-
-        return deleteServer.count()
+        return MmkvManager.removeServers(deleteServer)
     }
 
     /**
@@ -582,17 +660,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * @return The number of removed servers.
      */
     fun removeAllServer(): Int {
-        val count =
-            if (subscriptionId.isEmpty() && keywordFilter.isEmpty()) {
-                MmkvManager.removeAllServer()
-            } else {
-                val serversCopy = serversCache.toList()
-                for (item in serversCopy) {
-                    MmkvManager.removeServer(item.guid)
-                }
-                serversCache.toList().count()
-            }
-        return count
+        val scopedGuids = getScopedGuidSnapshot()
+        return MmkvManager.removeServers(scopedGuids)
     }
 
     /**
@@ -600,16 +669,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * @return The number of removed servers.
      */
     fun removeInvalidServer(): Int {
-        var count = 0
-        if (subscriptionId.isEmpty() && keywordFilter.isEmpty()) {
-            count += MmkvManager.removeInvalidServer("")
-        } else {
-            val serversCopy = serversCache.toList()
-            for (item in serversCopy) {
-                count += MmkvManager.removeInvalidServer(item.guid)
-            }
+        val invalidGuids = getScopedGuidSnapshot().filter { guid ->
+            (MmkvManager.decodeServerAffiliationInfo(guid)?.testDelayMillis ?: 0L) < 0L
         }
-        return count
+        return MmkvManager.removeServers(invalidGuids)
     }
 
     /**
@@ -625,9 +688,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val originalIndex: Int
         )
 
+        val scopedGuids = getScopedGuidSnapshot()
+        if (scopedGuids.size <= 1) {
+            return
+        }
+
         val serverScores = mutableListOf<ServerScore>()
-        val serverList = MmkvManager.decodeServerList()
-        serverList.forEachIndexed { index, key ->
+        scopedGuids.forEachIndexed { index, key ->
             val aff = MmkvManager.decodeServerAffiliationInfo(key)
             val samples = aff?.testDelaySamples.orEmpty()
             val successCount = if (samples.isNotEmpty()) {
@@ -684,8 +751,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
             .map { it.guid }
 
-        serverList.clear()
-        serverList.addAll(sortedServerGuids)
+        val serverList = MmkvManager.decodeServerList()
+        val scopedGuidSet = sortedServerGuids.toHashSet()
+        var sortedIndex = 0
+        for (index in serverList.indices) {
+            if (!scopedGuidSet.contains(serverList[index])) {
+                continue
+            }
+            if (sortedIndex >= sortedServerGuids.size) {
+                break
+            }
+            serverList[index] = sortedServerGuids[sortedIndex]
+            sortedIndex++
+        }
 
         MmkvManager.encodeServerList(serverList)
     }
@@ -714,13 +792,36 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun onTestsFinished() {
+        // Use the scope that was active when the test started, not the current one.
+        // This ensures auto-remove/auto-sort only affect the group that was tested,
+        // even if the user switched tabs during the test.
+        val savedSubId = testScopeSubscriptionId
+        val savedKeyword = testScopeKeywordFilter
+        testScopeSubscriptionId = null
+        testScopeKeywordFilter = null
+
         viewModelScope.launch(Dispatchers.Default) {
-            if (MmkvManager.decodeSettingsBool(AppConfig.PREF_AUTO_REMOVE_INVALID_AFTER_TEST)) {
-                removeInvalidServer()
+            val originalSubId = subscriptionId
+            val originalKeyword = keywordFilter
+            val needRestore = savedSubId != null && (savedSubId != originalSubId || savedKeyword != originalKeyword)
+            if (needRestore) {
+                subscriptionId = savedSubId!!
+                keywordFilter = savedKeyword ?: originalKeyword
             }
 
-            if (MmkvManager.decodeSettingsBool(AppConfig.PREF_AUTO_SORT_AFTER_TEST)) {
-                sortByTestResults()
+            try {
+                if (MmkvManager.decodeSettingsBool(AppConfig.PREF_AUTO_REMOVE_INVALID_AFTER_TEST)) {
+                    removeInvalidServer()
+                }
+
+                if (MmkvManager.decodeSettingsBool(AppConfig.PREF_AUTO_SORT_AFTER_TEST)) {
+                    sortByTestResults()
+                }
+            } finally {
+                if (needRestore) {
+                    subscriptionId = originalSubId
+                    keywordFilter = originalKeyword
+                }
             }
 
             withContext(Dispatchers.Main) {

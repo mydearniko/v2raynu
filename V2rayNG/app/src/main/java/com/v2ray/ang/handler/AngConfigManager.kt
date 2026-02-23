@@ -24,8 +24,17 @@ import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.QRCodeDecoder
 import com.v2ray.ang.util.Utils
 import java.net.URI
+import java.util.concurrent.Callable
+import java.util.concurrent.Executors
 
 object AngConfigManager {
+    private const val SUBSCRIPTION_FETCH_TIMEOUT_MS = 4_000
+    private const val MAX_PARALLEL_SUBSCRIPTION_FETCHES = 6
+
+    private data class PreparedSubscription(
+        val cache: SubscriptionCache,
+        val url: String
+    )
 
 
     /**
@@ -237,17 +246,36 @@ object AngConfigManager {
             }
 
             val subItem = MmkvManager.decodeSubscription(subid)
-            var count = 0
+            val parsedConfigs = mutableListOf<ProfileItem>()
             servers.lines()
                 .distinct()
                 .reversed()
-                .forEach {
-                    val resId = parseConfig(it, subid, subItem, removedSelectedServer)
-                    if (resId == 0) {
-                        count++
+                .forEach { str ->
+                    val config = parseConfigToProfile(str, subid, subItem)
+                    if (config != null) {
+                        parsedConfigs.add(config)
                     }
                 }
-            return count
+
+            if (parsedConfigs.isEmpty()) return 0
+
+            // Batch-encode all configs with a single server-list update
+            val guids = MmkvManager.encodeServerConfigs(parsedConfigs)
+
+            // Restore selected server if it was removed during the update
+            if (removedSelectedServer != null) {
+                for (i in parsedConfigs.indices) {
+                    val config = parsedConfigs[i]
+                    if (config.server == removedSelectedServer.server &&
+                        config.serverPort == removedSelectedServer.serverPort
+                    ) {
+                        MmkvManager.setSelectServer(guids[i])
+                        break
+                    }
+                }
+            }
+
+            return parsedConfigs.size
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to parse batch config", e)
         }
@@ -326,15 +354,18 @@ object AngConfigManager {
      * @param removedSelectedServer The removed selected server.
      * @return The result code.
      */
-    private fun parseConfig(
+    /**
+     * Parses a single config line into a ProfileItem without encoding to storage.
+     * Used by parseBatchConfig for batch encoding.
+     */
+    private fun parseConfigToProfile(
         str: String?,
         subid: String,
-        subItem: SubscriptionItem?,
-        removedSelectedServer: ProfileItem?
-    ): Int {
+        subItem: SubscriptionItem?
+    ): ProfileItem? {
         try {
             if (str == null || TextUtils.isEmpty(str)) {
-                return R.string.toast_none_data
+                return null
             }
 
             val config = if (str.startsWith(EConfigType.VMESS.protocolScheme)) {
@@ -356,28 +387,22 @@ object AngConfigManager {
             }
 
             if (config == null) {
-                return R.string.toast_incorrect_protocol
+                return null
             }
             //filter
             if (subItem?.filter != null && subItem.filter?.isNotEmpty() == true && config.remarks.isNotEmpty()) {
                 val matched = Regex(pattern = subItem.filter ?: "")
                     .containsMatchIn(input = config.remarks)
-                if (!matched) return -1
+                if (!matched) return null
             }
 
             config.subscriptionId = subid
             config.description = generateDescription(config)
-            val guid = MmkvManager.encodeServerConfig("", config)
-            if (removedSelectedServer != null &&
-                config.server == removedSelectedServer.server && config.serverPort == removedSelectedServer.serverPort
-            ) {
-                MmkvManager.setSelectServer(guid)
-            }
+            return config
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to parse config", e)
-            return -1
+            return null
         }
-        return 0
     }
 
     /**
@@ -385,17 +410,25 @@ object AngConfigManager {
      *
      * @return The number of configurations updated.
      */
-    fun updateConfigViaSubAll(): Int {
-        var count = 0
+    fun updateConfigViaSubAll(subscriptions: List<SubscriptionCache> = MmkvManager.decodeSubscriptions()): Int {
         try {
-            MmkvManager.decodeSubscriptions().forEach {
-                count += updateConfigViaSub(it)
+            val preparedSubscriptions = subscriptions
+                .mapNotNull(::prepareSubscriptionForUpdate)
+            if (preparedSubscriptions.isEmpty()) {
+                return 0
             }
+
+            val fetchedConfigByGuid = fetchSubscriptionContentInParallel(preparedSubscriptions)
+            var count = 0
+            preparedSubscriptions.forEach { prepared ->
+                val configText = fetchedConfigByGuid[prepared.cache.guid].orEmpty()
+                count += applySubscriptionConfig(prepared.cache, configText)
+            }
+            return count
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to update config via all subscriptions", e)
             return 0
         }
-        return count
     }
 
     /**
@@ -406,55 +439,105 @@ object AngConfigManager {
      */
     fun updateConfigViaSub(it: SubscriptionCache): Int {
         try {
-            if (TextUtils.isEmpty(it.guid)
-                || TextUtils.isEmpty(it.subscription.remarks)
-                || TextUtils.isEmpty(it.subscription.url)
-            ) {
-                return 0
-            }
-            if (!it.subscription.enabled) {
-                return 0
-            }
-            val url = HttpUtil.toIdnUrl(it.subscription.url)
-            if (!Utils.isValidUrl(url)) {
-                return 0
-            }
-            if (!it.subscription.allowInsecureUrl) {
-                if (!Utils.isValidSubUrl(url)) {
-                    return 0
-                }
-            }
-            Log.i(AppConfig.TAG, url)
-            val userAgent = it.subscription.userAgent
-
-            var configText = try {
-                val httpPort = SettingsManager.getHttpPort()
-                HttpUtil.getUrlContentWithUserAgent(url, userAgent, 15000, httpPort)
-            } catch (e: Exception) {
-                Log.e(AppConfig.ANG_PACKAGE, "Update subscription: proxy not ready or other error", e)
-                ""
-            }
-            if (configText.isEmpty()) {
-                configText = try {
-                    HttpUtil.getUrlContentWithUserAgent(url, userAgent)
-                } catch (e: Exception) {
-                    Log.e(AppConfig.TAG, "Update subscription: Failed to get URL content with user agent", e)
-                    ""
-                }
-            }
-            if (configText.isEmpty()) {
-                return 0
-            }
-            val count = parseConfigViaSub(configText, it.guid, false)
-            if (count > 0) {
-                it.subscription.lastUpdated = System.currentTimeMillis()
-                MmkvManager.encodeSubscription(it.guid, it.subscription)
-                Log.i(AppConfig.TAG, "Subscription updated: ${it.subscription.remarks}, $count configs")
-            }
-            return count
+            val prepared = prepareSubscriptionForUpdate(it) ?: return 0
+            val configText = fetchSubscriptionContent(prepared.url, prepared.cache.subscription.userAgent)
+            return applySubscriptionConfig(prepared.cache, configText)
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to update config via subscription", e)
             return 0
+        }
+    }
+
+    private fun prepareSubscriptionForUpdate(subscription: SubscriptionCache): PreparedSubscription? {
+        if (TextUtils.isEmpty(subscription.guid)
+            || TextUtils.isEmpty(subscription.subscription.remarks)
+            || TextUtils.isEmpty(subscription.subscription.url)
+        ) {
+            return null
+        }
+        if (!subscription.subscription.enabled) {
+            return null
+        }
+
+        val normalizedUrl = try {
+            HttpUtil.toIdnUrl(subscription.subscription.url)
+        } catch (e: Exception) {
+            Log.e(AppConfig.TAG, "Update subscription: invalid URL", e)
+            return null
+        }
+
+        if (!Utils.isValidUrl(normalizedUrl)) {
+            return null
+        }
+        if (!subscription.subscription.allowInsecureUrl && !Utils.isValidSubUrl(normalizedUrl)) {
+            return null
+        }
+
+        Log.i(AppConfig.TAG, normalizedUrl)
+        return PreparedSubscription(subscription, normalizedUrl)
+    }
+
+    private fun fetchSubscriptionContentInParallel(preparedSubscriptions: List<PreparedSubscription>): Map<String, String> {
+        val threadCount = preparedSubscriptions.size
+            .coerceAtMost(MAX_PARALLEL_SUBSCRIPTION_FETCHES)
+            .coerceAtLeast(1)
+        val executor = Executors.newFixedThreadPool(threadCount)
+        return try {
+            val tasks = preparedSubscriptions.associate { prepared ->
+                prepared.cache.guid to executor.submit(
+                    Callable {
+                        fetchSubscriptionContent(prepared.url, prepared.cache.subscription.userAgent)
+                    }
+                )
+            }
+            tasks.mapValues { (_, future) ->
+                runCatching { future.get() }.getOrDefault("")
+            }
+        } finally {
+            executor.shutdownNow()
+        }
+    }
+
+    private fun fetchSubscriptionContent(url: String, userAgent: String?): String {
+        val directText = try {
+            HttpUtil.getUrlContentWithUserAgent(url, userAgent, SUBSCRIPTION_FETCH_TIMEOUT_MS)
+        } catch (e: Exception) {
+            Log.w(AppConfig.TAG, "Update subscription: direct fetch failed for $url: ${e.message}")
+            ""
+        }
+        if (directText.isNotEmpty()) {
+            return directText
+        }
+
+        val httpPort = SettingsManager.getHttpPort()
+        if (httpPort <= 0) {
+            return ""
+        }
+
+        return try {
+            HttpUtil.getUrlContentWithUserAgent(url, userAgent, SUBSCRIPTION_FETCH_TIMEOUT_MS, httpPort)
+        } catch (e: Exception) {
+            Log.w(AppConfig.ANG_PACKAGE, "Update subscription: proxy fetch failed for $url: ${e.message}")
+            ""
+        }
+    }
+
+    private fun applySubscriptionConfig(subscription: SubscriptionCache, configText: String): Int {
+        if (configText.isEmpty()) {
+            return 0
+        }
+
+        return try {
+            val count = parseConfigViaSub(configText, subscription.guid, false)
+            if (count > 0) {
+                subscription.subscription.lastUpdated = System.currentTimeMillis()
+                MmkvManager.encodeSubscription(subscription.guid, subscription.subscription)
+                Log.i(AppConfig.TAG, "Subscription updated: ${subscription.subscription.remarks}, $count configs")
+            }
+            count
+        } catch (e: Exception) {
+            Log.e(AppConfig.TAG, "Failed to parse updated subscription", e)
+            0
         }
     }
 

@@ -34,7 +34,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 
 class SubSettingActivity : BaseActivity() {
     companion object {
-        private const val SUBSCRIPTION_UPDATE_TIMEOUT_MS = 180_000L
+        private const val SUBSCRIPTION_UPDATE_TIMEOUT_MS = 30_000L
     }
 
     private val binding by lazy { ActivitySubSettingBinding.inflate(layoutInflater) }
