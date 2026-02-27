@@ -13,7 +13,6 @@ import com.v2ray.ang.AngApplication
 import com.v2ray.ang.AppConfig
 import com.v2ray.ang.AppConfig.VPN
 import com.v2ray.ang.R
-import com.v2ray.ang.extension.toLongEx
 import com.v2ray.ang.handler.MmkvManager
 import com.v2ray.ang.helper.MmkvPreferenceDataStore
 import com.v2ray.ang.handler.SettingsManager
@@ -101,8 +100,16 @@ class SettingsActivity : BaseActivity() {
                 val value = newValue as Boolean
                 autoUpdateCheck?.isChecked = value
                 autoUpdateInterval?.isEnabled = value
-                autoUpdateInterval?.text?.toLongEx()?.let {
-                    if (newValue) configureUpdateTask(it) else cancelUpdateTask()
+                val intervalMinutes = normalizeAutoUpdateIntervalMinutes(autoUpdateInterval?.text)
+                if (value) configureUpdateTask(intervalMinutes) else cancelUpdateTask()
+                updateAutoUpdateInterval(autoUpdateInterval?.text)
+                true
+            }
+            autoUpdateInterval?.setOnPreferenceChangeListener { _, newValue ->
+                val normalized = normalizeAutoUpdateIntervalMinutes(newValue as? String)
+                autoUpdateInterval?.summary = normalized.toString()
+                if (autoUpdateCheck?.isChecked == true) {
+                    configureUpdateTask(normalized)
                 }
                 true
             }
@@ -187,6 +194,7 @@ class SettingsActivity : BaseActivity() {
 
             // Initialize auto-update interval state
             autoUpdateInterval?.isEnabled = MmkvManager.decodeSettingsBool(AppConfig.SUBSCRIPTION_AUTO_UPDATE, false)
+            updateAutoUpdateInterval(MmkvManager.decodeSettingsString(AppConfig.SUBSCRIPTION_AUTO_UPDATE_INTERVAL))
 
             // Initialize real-ping thread summary state
             updateRealPingThreads(MmkvManager.decodeSettingsString(AppConfig.PREF_REAL_PING_THREADS))
@@ -240,6 +248,7 @@ class SettingsActivity : BaseActivity() {
         }
 
         private fun configureUpdateTask(interval: Long) {
+            val normalizedInterval = interval.coerceAtLeast(15L)
             val rw = RemoteWorkManager.getInstance(AngApplication.application)
             rw.cancelUniqueWork(AppConfig.SUBSCRIPTION_UPDATE_TASK_NAME)
             rw.enqueueUniquePeriodicWork(
@@ -247,11 +256,11 @@ class SettingsActivity : BaseActivity() {
                 ExistingPeriodicWorkPolicy.UPDATE,
                 PeriodicWorkRequest.Builder(
                     SubscriptionUpdater.UpdateTask::class.java,
-                    interval,
+                    normalizedInterval,
                     TimeUnit.MINUTES
                 )
                     .apply {
-                        setInitialDelay(interval, TimeUnit.MINUTES)
+                        setInitialDelay(normalizedInterval, TimeUnit.MINUTES)
                     }
                     .build()
             )
@@ -311,6 +320,15 @@ class SettingsActivity : BaseActivity() {
             val configuredTimeout = value?.toIntOrNull() ?: defaultTimeout
             val normalized = configuredTimeout.coerceIn(500, 30000)
             realPingTimeout?.summary = normalized.toString()
+        }
+
+        private fun normalizeAutoUpdateIntervalMinutes(value: String?): Long {
+            val defaultInterval = AppConfig.SUBSCRIPTION_DEFAULT_UPDATE_INTERVAL.toLongOrNull() ?: 1440L
+            return (value?.trim()?.toLongOrNull() ?: defaultInterval).coerceAtLeast(15L)
+        }
+
+        private fun updateAutoUpdateInterval(value: String?) {
+            autoUpdateInterval?.summary = normalizeAutoUpdateIntervalMinutes(value).toString()
         }
     }
 

@@ -740,6 +740,9 @@ object V2rayConfigManager {
                             if (key.isEmpty() || value.isEmpty()) {
                                 return@mapNotNull null
                             }
+                            if (ipv6Disabled && SettingsManager.isIpv6EndpointEntry(value)) {
+                                return@mapNotNull null
+                            }
                             key to value
                         }
                         .toMap()

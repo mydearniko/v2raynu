@@ -77,6 +77,9 @@ class MmkvPreferenceDataStore : PreferenceDataStore() {
         if (key == AppConfig.PREF_UI_MODE_NIGHT) {
             SettingsManager.setNightMode()
         }
+        if (key == AppConfig.PREF_LANGUAGE || key == AppConfig.PREF_DOUBLE_COLUMN_DISPLAY) {
+            SettingsChangeManager.makeRefreshMainUi()
+        }
         // Notify listeners that require service restart or reinit
         SettingsChangeManager.makeRestartService()
     }

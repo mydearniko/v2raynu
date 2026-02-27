@@ -1,6 +1,7 @@
 package com.v2ray.ang.service
 
 import android.content.Context
+import android.os.SystemClock
 import com.v2ray.ang.AppConfig
 import com.v2ray.ang.dto.RealPingResult
 import com.v2ray.ang.handler.SettingsManager
@@ -10,15 +11,18 @@ import com.v2ray.ang.util.MessageUtil
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.channels.Channel
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadFactory
@@ -43,12 +47,14 @@ class RealPingWorkerService(
         private const val MEASUREMENTS_PER_SERVER = 3
         private const val INITIAL_PRIMARY_SAMPLE_COUNT = 1
         private const val PROGRESS_HEARTBEAT_MS = 1000L
-        private const val STARTUP_BARRIER_TIMEOUT_SECONDS = 2L
-        private const val NETWORK_WARMUP_WORKER_LIMIT = 2
-        private const val WARMUP_CONFIG_SCAN_LIMIT = 64
+        private const val PROGRESS_MIN_UPDATE_INTERVAL_MS = 200L
+        private const val NETWORK_WARMUP_WORKER_LIMIT = 1
         private const val MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT = 1
-        private const val MAX_PARALLEL_NATIVE_MEASUREMENTS = 64
-        private const val LAST_RESORT_SAMPLE_COUNT = 1
+        private const val FIRST_WAVE_PARALLEL_URLS_HIGH_THREADS = 3
+        private const val FIRST_WAVE_PARALLEL_URLS_MID_THREADS = 2
+        private const val FIRST_WAVE_PARALLEL_THREADS_HIGH_THRESHOLD = 256
+        private const val FIRST_WAVE_PARALLEL_THREADS_MID_THRESHOLD = 96
+        private const val MAX_PARALLEL_FALLBACK_URLS = 4
         private const val PROBE_URL_SCORE_SUCCESS_DELTA = 4
         private const val PROBE_URL_SCORE_FAILURE_DELTA = -3
         private const val PROBE_URL_SCORE_MIN = -100
@@ -60,7 +66,7 @@ class RealPingWorkerService(
 
     private val job = SupervisorJob()
     private val configuredThreads = SettingsManager.getRealPingThreadCount()
-    private val workerThreads = min(configuredThreads, guids.size.coerceAtLeast(1))
+    private val workerThreads = min(configuredThreads, guids.size.coerceAtLeast(1)).coerceAtLeast(1)
     private val executor = ThreadPoolExecutor(
         workerThreads,
         workerThreads,
@@ -74,14 +80,20 @@ class RealPingWorkerService(
     private val dispatcher = executor.asCoroutineDispatcher()
     private val scope = CoroutineScope(job + dispatcher + CoroutineName("RealPingBatchWorker"))
     private val nativeMeasurementSemaphore = Semaphore(
-        min(workerThreads, MAX_PARALLEL_NATIVE_MEASUREMENTS).coerceAtLeast(1),
+        workerThreads.coerceAtLeast(1),
         true
     )
+    private val firstWaveParallelUrlCount = when {
+        workerThreads >= FIRST_WAVE_PARALLEL_THREADS_HIGH_THRESHOLD -> FIRST_WAVE_PARALLEL_URLS_HIGH_THREADS
+        workerThreads >= FIRST_WAVE_PARALLEL_THREADS_MID_THRESHOLD -> FIRST_WAVE_PARALLEL_URLS_MID_THREADS
+        else -> 1
+    }
 
     private val runningCount = AtomicInteger(0)
     private val remainingCount = AtomicInteger(0)
     private val completedServerCount = AtomicInteger(0)
     private val startedAtMillis = AtomicLong(0L)
+    private val lastProgressNotifyAtMs = AtomicLong(0L)
     private val speedtestConfigCache = ConcurrentHashMap<String, CachedSpeedtestConfig>()
     private val probeUrlScores = ConcurrentHashMap<String, AtomicInteger>()
     @Volatile
@@ -114,7 +126,8 @@ class RealPingWorkerService(
         startedAtMillis.set(System.currentTimeMillis())
         remainingCount.set(guids.size)
         completedServerCount.set(0)
-        notifyProgress()
+        lastProgressNotifyAtMs.set(0L)
+        notifyProgress(force = true)
 
         heartbeatJob = scope.launch {
             while (isActive && shouldRun()) {
@@ -126,20 +139,12 @@ class RealPingWorkerService(
         val queue = Channel<String>(capacity = workerThreads * 2)
         val workers = mutableListOf<kotlinx.coroutines.Job>()
         val activeWorkers = workerThreads
-        val startupBarrier = CountDownLatch(activeWorkers)
         val warmupConfig = prepareWarmupConfig()
 
         val warmupWorkers = min(activeWorkers, NETWORK_WARMUP_WORKER_LIMIT)
         repeat(activeWorkers) { workerIndex ->
             workers.add(
                 scope.launch {
-                    startupBarrier.countDown()
-                    try {
-                        startupBarrier.await(STARTUP_BARRIER_TIMEOUT_SECONDS, TimeUnit.SECONDS)
-                    } catch (_: Throwable) {
-                        // ignore
-                    }
-
                     if (workerIndex < warmupWorkers) {
                         prewarmWorker(warmupConfig, warmupUrl)
                     }
@@ -195,7 +200,7 @@ class RealPingWorkerService(
                 }
             } finally {
                 heartbeatJob?.cancel()
-                notifyProgress()
+                notifyProgress(force = true)
                 close()
             }
         }
@@ -225,7 +230,7 @@ class RealPingWorkerService(
         }
     }
 
-    private fun startRealPing(guid: String, probeUrls: List<String>): LongArray {
+    private suspend fun startRealPing(guid: String, probeUrls: List<String>): LongArray {
         val retFailure = LongArray(MEASUREMENTS_PER_SERVER) { -1L }
         if (!shouldRun() || !job.isActive || probeUrls.isEmpty()) {
             return retFailure
@@ -242,38 +247,34 @@ class RealPingWorkerService(
             if (orderedProbeUrls.isEmpty()) {
                 return retFailure
             }
-            val primaryUrl = orderedProbeUrls.first()
             var attemptedCount = 0
-            val primarySamples = measureSamples(
-                config = configResult.content,
-                testUrl = primaryUrl,
-                sampleCount = INITIAL_PRIMARY_SAMPLE_COUNT
-            )
-            recordProbeUrlOutcome(primaryUrl, primarySamples)
-            attemptedCount += primarySamples.size
-            var mergedSamples = normalizeSamples(
-                primarySamples
-            )
+            val firstWaveUrls = orderedProbeUrls
+                .take(firstWaveParallelUrlCount.coerceIn(1, orderedProbeUrls.size))
+            var mergedSamples = LongArray(MEASUREMENTS_PER_SERVER) { -1L }
             var successCount = mergedSamples.count { it >= 0L }
-            if (successCount >= MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT) {
-                return trimDisplaySamples(mergedSamples, attemptedCount)
-            }
 
-            val secondaryUrl = orderedProbeUrls.getOrNull(1)
-            if (!secondaryUrl.isNullOrBlank() && shouldRun() && job.isActive) {
-                val secondaryBudget = min(
-                    mergedSamples.count { it < 0L },
-                    (MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT - successCount).coerceAtLeast(1)
+            if (firstWaveUrls.size == 1) {
+                val primaryUrl = firstWaveUrls.first()
+                val primarySamples = measureSamples(
+                    config = configResult.content,
+                    testUrl = primaryUrl,
+                    sampleCount = INITIAL_PRIMARY_SAMPLE_COUNT
                 )
-                if (secondaryBudget > 0) {
-                    val secondarySamples = measureSamples(
-                        config = configResult.content,
-                        testUrl = secondaryUrl,
-                        sampleCount = secondaryBudget
-                    )
-                    recordProbeUrlOutcome(secondaryUrl, secondarySamples)
-                    attemptedCount += secondarySamples.size
-                    mergedSamples = mergePrimaryAndFallbackSamples(mergedSamples, secondarySamples)
+                recordProbeUrlOutcome(primaryUrl, primarySamples)
+                attemptedCount += primarySamples.size
+                mergedSamples = normalizeSamples(primarySamples)
+                successCount = mergedSamples.count { it >= 0L }
+                if (successCount >= MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT) {
+                    return trimDisplaySamples(mergedSamples, attemptedCount)
+                }
+            } else {
+                val firstWaveAttempts = measureFallbackUrlsInParallel(
+                    config = configResult.content,
+                    probeUrls = firstWaveUrls
+                )
+                attemptedCount += firstWaveAttempts.attemptedCount
+                if (firstWaveAttempts.bestSamples.isNotEmpty()) {
+                    mergedSamples = mergePrimaryAndFallbackSamples(mergedSamples, firstWaveAttempts.bestSamples)
                     successCount = mergedSamples.count { it >= 0L }
                     if (successCount >= MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT) {
                         return trimDisplaySamples(mergedSamples, attemptedCount)
@@ -281,37 +282,16 @@ class RealPingWorkerService(
                 }
             }
 
-            if (successCount < MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT) {
-                for (extraUrl in orderedProbeUrls.drop(2)) {
-                    if (!shouldRun() || !job.isActive) {
-                        break
-                    }
-                    val remainingSlots = mergedSamples.count { it < 0L }
-                    if (remainingSlots <= 0) {
-                        break
-                    }
-                    val extraBudget = min(
-                        remainingSlots,
-                        min(
-                            (MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT - successCount).coerceAtLeast(1),
-                            LAST_RESORT_SAMPLE_COUNT
-                        )
-                    )
-                    if (extraBudget <= 0) {
-                        break
-                    }
-                    val extraSamples = measureSamples(
-                        config = configResult.content,
-                        testUrl = extraUrl,
-                        sampleCount = extraBudget
-                    )
-                    recordProbeUrlOutcome(extraUrl, extraSamples)
-                    attemptedCount += extraSamples.size
-                    mergedSamples = mergePrimaryAndFallbackSamples(mergedSamples, extraSamples)
-                    successCount = mergedSamples.count { it >= 0L }
-                    if (successCount >= MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT) {
-                        break
-                    }
+            val fallbackAttempts = measureFallbackUrlsInParallel(
+                config = configResult.content,
+                probeUrls = orderedProbeUrls.drop(firstWaveUrls.size)
+            )
+            attemptedCount += fallbackAttempts.attemptedCount
+            if (fallbackAttempts.bestSamples.isNotEmpty()) {
+                mergedSamples = mergePrimaryAndFallbackSamples(mergedSamples, fallbackAttempts.bestSamples)
+                successCount = mergedSamples.count { it >= 0L }
+                if (successCount >= MIN_SUCCESS_SAMPLES_FOR_WORKING_RESULT) {
+                    return trimDisplaySamples(mergedSamples, attemptedCount)
                 }
             }
 
@@ -319,6 +299,82 @@ class RealPingWorkerService(
         } finally {
             speedtestConfigCache.remove(guid)
         }
+    }
+
+    private data class FallbackAttemptResult(
+        val attemptedCount: Int,
+        val bestSamples: LongArray
+    )
+
+    private suspend fun measureFallbackUrlsInParallel(
+        config: String,
+        probeUrls: List<String>
+    ): FallbackAttemptResult = coroutineScope {
+        if (probeUrls.isEmpty() || !shouldRun() || !job.isActive) {
+            return@coroutineScope FallbackAttemptResult(
+                attemptedCount = 0,
+                bestSamples = LongArray(0)
+            )
+        }
+
+        val candidates = probeUrls
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .take(MAX_PARALLEL_FALLBACK_URLS)
+            .toList()
+        if (candidates.isEmpty()) {
+            return@coroutineScope FallbackAttemptResult(
+                attemptedCount = 0,
+                bestSamples = LongArray(0)
+            )
+        }
+
+        val tasks = candidates.map { url ->
+            async(Dispatchers.IO) {
+                if (!shouldRun() || !job.isActive) {
+                    url to LongArray(0)
+                } else {
+                    url to measureSamples(
+                        config = config,
+                        testUrl = url,
+                        sampleCount = 1
+                    )
+                }
+            }
+        }.toMutableList()
+
+        var attemptedCount = 0
+        var bestSamples = LongArray(0)
+        try {
+            while (tasks.isNotEmpty() && shouldRun() && job.isActive) {
+                val (finished, outcome) = select<Pair<kotlinx.coroutines.Deferred<Pair<String, LongArray>>, Pair<String, LongArray>>> {
+                    tasks.forEach { task ->
+                        task.onAwait { value -> task to value }
+                    }
+                }
+                tasks.remove(finished)
+
+                val (url, samples) = outcome
+                if (samples.isEmpty()) {
+                    continue
+                }
+                attemptedCount += samples.size
+                recordProbeUrlOutcome(url, samples)
+                if (samples.any { it >= 0L }) {
+                    bestSamples = samples
+                    break
+                }
+            }
+        } finally {
+            tasks.forEach { it.cancel() }
+        }
+
+        return@coroutineScope FallbackAttemptResult(
+            attemptedCount = attemptedCount,
+            bestSamples = bestSamples
+        )
     }
 
     private fun measureSamples(
@@ -478,15 +534,9 @@ class RealPingWorkerService(
     }
 
     private fun prepareWarmupConfig(): String? {
-        val scanLimit = min(guids.size, WARMUP_CONFIG_SCAN_LIMIT)
-        for (index in 0 until scanLimit) {
-            val guid = guids[index]
-            val configResult = getSpeedtestConfig(guid)
-            if (configResult.status) {
-                return configResult.content
-            }
-        }
-        return null
+        val firstGuid = guids.firstOrNull() ?: return null
+        val configResult = getSpeedtestConfig(firstGuid)
+        return configResult.content.takeIf { configResult.status }
     }
 
     private fun prewarmWorker(warmupConfig: String?, testUrl: String) {
@@ -505,19 +555,32 @@ class RealPingWorkerService(
 
     private fun getSpeedtestConfig(guid: String): CachedSpeedtestConfig {
         speedtestConfigCache[guid]?.let { return it }
-        val configResult = V2rayConfigManager.getV2rayConfig4Speedtest(context, guid)
-        val cached = if (configResult.status) {
-            CachedSpeedtestConfig(status = true, content = configResult.content)
+        val speedtestConfig = V2rayConfigManager.getV2rayConfig4Speedtest(context, guid)
+        val cached = if (speedtestConfig.status && speedtestConfig.content.isNotBlank()) {
+            CachedSpeedtestConfig(status = true, content = speedtestConfig.content)
         } else {
-            CachedSpeedtestConfig(status = false, content = "")
+            // Fallback to full runtime config for profiles that fail speedtest config generation.
+            val fullConfig = V2rayConfigManager.getV2rayConfig(context, guid)
+            if (fullConfig.status && fullConfig.content.isNotBlank()) {
+                CachedSpeedtestConfig(status = true, content = fullConfig.content)
+            } else {
+                CachedSpeedtestConfig(status = false, content = "")
+            }
         }
         speedtestConfigCache[guid] = cached
         return cached
     }
 
-    private fun notifyProgress() {
+    private fun notifyProgress(force: Boolean = false) {
         if (!shouldRun()) {
             return
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (!force) {
+            val last = lastProgressNotifyAtMs.get()
+            if (now - last < PROGRESS_MIN_UPDATE_INTERVAL_MS) {
+                return
+            }
         }
         val totalServers = guids.size.coerceAtLeast(1)
         val elapsedSeconds = ((System.currentTimeMillis() - startedAtMillis.get()) / 1000L).coerceAtLeast(0L)
@@ -532,7 +595,11 @@ class RealPingWorkerService(
             append(" left / ")
             append(elapsedSeconds)
             append('s')
+            append(" / ")
+            append(workerThreads)
+            append(" threads")
         }
+        lastProgressNotifyAtMs.set(now)
         MessageUtil.sendMsg2UI(context, AppConfig.MSG_MEASURE_CONFIG_NOTIFY, content)
     }
 

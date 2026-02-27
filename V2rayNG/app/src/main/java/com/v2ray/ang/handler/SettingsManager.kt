@@ -25,6 +25,7 @@ import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.Utils
 import java.io.File
 import java.io.FileOutputStream
+import java.net.URI
 import java.util.Collections
 import java.util.Locale
 
@@ -35,6 +36,18 @@ object SettingsManager {
     private const val REAL_PING_TIMEOUT_MIN_MS = 500
     private const val REAL_PING_TIMEOUT_MAX_MS = 30000
     private const val REAL_PING_TIMEOUT_DEFAULT_MS = 3000
+
+    private fun decodeNumericSetting(key: String): Int? {
+        val raw = MmkvManager.decodeSettingsString(key)
+        if (!raw.isNullOrBlank()) {
+            val trimmed = raw.trim()
+            trimmed.toIntOrNull()?.let { return it }
+            Regex("-?\\d+").find(trimmed)?.value?.toIntOrNull()?.let { return it }
+        }
+        val sentinel = Int.MIN_VALUE
+        val asInt = MmkvManager.decodeSettingsInt(key, sentinel)
+        return asInt.takeIf { it != sentinel }
+    }
 
     /**
      * Initialize routing rulesets.
@@ -348,11 +361,25 @@ object SettingsManager {
         return !isIpv6Disabled() && MmkvManager.decodeSettingsBool(AppConfig.PREF_PREFER_IPV6) == true
     }
 
+    internal fun isIpv6EndpointEntry(entry: String): Boolean {
+        val normalized = entry.trim()
+        if (normalized.isEmpty()) {
+            return false
+        }
+        if (Utils.isPureIpAddress(normalized)) {
+            return normalized.contains(':')
+        }
+        val host = try {
+            URI(normalized).host?.trim()?.trim('[', ']')
+        } catch (_: Exception) {
+            null
+        } ?: return false
+        return Utils.isPureIpAddress(host) && host.contains(':')
+    }
+
     private fun filterOutIpv6AddressesIfDisabled(entries: List<String>): List<String> {
         if (!isIpv6Disabled()) return entries
-        return entries.filterNot { entry ->
-            Utils.isPureIpAddress(entry) && entry.contains(':')
-        }
+        return entries.filterNot(::isIpv6EndpointEntry)
     }
 
     /**
@@ -420,7 +447,7 @@ object SettingsManager {
      * Returns real-ping worker thread count from settings with clamped bounds.
      */
     fun getRealPingThreadCount(): Int {
-        val configured = MmkvManager.decodeSettingsString(AppConfig.PREF_REAL_PING_THREADS)?.toIntOrNull()
+        val configured = decodeNumericSetting(AppConfig.PREF_REAL_PING_THREADS)
         return (configured ?: getDefaultRealPingThreadCount())
             .coerceIn(REAL_PING_THREAD_MIN, REAL_PING_THREAD_MAX)
     }
@@ -436,7 +463,7 @@ object SettingsManager {
      * Returns real-ping timeout per attempt in milliseconds with clamped bounds.
      */
     fun getRealPingAttemptTimeoutMillis(): Int {
-        val configured = MmkvManager.decodeSettingsString(AppConfig.PREF_REAL_PING_TIMEOUT)?.toIntOrNull()
+        val configured = decodeNumericSetting(AppConfig.PREF_REAL_PING_TIMEOUT)
         return (configured ?: getDefaultRealPingAttemptTimeoutMillis())
             .coerceIn(REAL_PING_TIMEOUT_MIN_MS, REAL_PING_TIMEOUT_MAX_MS)
     }
@@ -518,7 +545,7 @@ object SettingsManager {
     fun ensureDefaultSettings() {
         // Write defaults in the exact order requested by the user
         ensureDefaultValue(AppConfig.PREF_MODE, AppConfig.VPN)
-        ensureDefaultValue(AppConfig.PREF_DISABLE_IPV6, "false")
+        ensureDefaultValue(AppConfig.PREF_DISABLE_IPV6, false)
         ensureDefaultValue(AppConfig.PREF_VPN_DNS, AppConfig.DNS_VPN)
         ensureDefaultValue(AppConfig.PREF_VPN_MTU, AppConfig.VPN_MTU.toString())
         ensureDefaultValue(AppConfig.SUBSCRIPTION_AUTO_UPDATE_INTERVAL, AppConfig.SUBSCRIPTION_DEFAULT_UPDATE_INTERVAL)
@@ -540,7 +567,13 @@ object SettingsManager {
     }
 
     private fun ensureDefaultValue(key: String, default: String) {
-        if (MmkvManager.decodeSettingsString(key).isNullOrEmpty()) {
+        if (!MmkvManager.containsSetting(key)) {
+            MmkvManager.encodeSettings(key, default)
+        }
+    }
+
+    private fun ensureDefaultValue(key: String, default: Boolean) {
+        if (!MmkvManager.containsSetting(key)) {
             MmkvManager.encodeSettings(key, default)
         }
     }

@@ -174,7 +174,7 @@ object MmkvManager {
             // Lightweight extraction without full deserialization
             val json = profileFullStorage.decodeString(guid) ?: continue
             try {
-                val server = org.json.JSONObject(json).optString("server", null)
+                val server = org.json.JSONObject(json).optString("server")
                 if (!server.isNullOrBlank()) {
                     result[guid] = server
                 }
@@ -849,6 +849,13 @@ object MmkvManager {
      */
     fun decodeSettingsBool(key: String, defaultValue: Boolean): Boolean {
         return settingsStorage.decodeBool(key, defaultValue)
+    }
+
+    /**
+     * Checks whether a settings key already exists in MMKV, regardless of value type.
+     */
+    fun containsSetting(key: String): Boolean {
+        return settingsStorage.containsKey(key)
     }
 
     /**

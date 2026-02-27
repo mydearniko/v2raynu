@@ -65,11 +65,15 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
         }
     }
     private val requestActivityLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        val refreshMainUi = SettingsChangeManager.consumeRefreshMainUi()
         if (SettingsChangeManager.consumeRestartService() && mainViewModel.isRunning.value == true) {
             restartV2Ray()
         }
         if (SettingsChangeManager.consumeSetupGroupTab()) {
             setupGroupTab()
+        }
+        if (refreshMainUi) {
+            recreate()
         }
     }
 

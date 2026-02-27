@@ -31,6 +31,7 @@ import com.v2ray.ang.handler.V2RayNativeManager
 import com.v2ray.ang.handler.V2RayServiceManager
 import com.v2ray.ang.handler.V2rayConfigManager
 import com.v2ray.ang.service.RealPingBatchStore
+import com.v2ray.ang.util.HttpUtil
 import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.MessageUtil
 import com.v2ray.ang.util.MyContextWrapper
@@ -42,6 +43,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -427,6 +429,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val generation = scopeIpCheckGeneration.get()
         val total = targetGuids.size
+        val unavailable = localizedString(R.string.ip_check_unavailable)
         val configuredThreadCount = SettingsManager.getRealPingThreadCount().coerceAtLeast(1)
         val workerCount = minOf(
             configuredThreadCount,
@@ -449,7 +452,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             return@withPermit
                         }
 
-                        MmkvManager.encodeServerIpCheckSummary(guid, ipA, ipB)
+                        val persisted = preserveExistingIpCheckSummary(
+                            guid = guid,
+                            ipA = ipA,
+                            ipB = ipB,
+                            unavailable = unavailable
+                        )
+                        MmkvManager.encodeServerIpCheckSummary(guid, persisted.first, persisted.second)
                         val completed = completionCount.incrementAndGet()
                         withContext(Dispatchers.Main) {
                             updateListAction.value = getPosition(guid)
@@ -482,6 +491,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         private const val PARALLEL_DELAY_ATTEMPTS = 3
         private const val MAX_SCOPED_IP_CHECK_WORKERS = 8
+        private const val TEMP_PROXY_WARMUP_TIMEOUT_MS = 900L
     }
 
     private fun isServerWorkingForIpCheck(aff: ServerAffiliationInfo?): Boolean {
@@ -523,7 +533,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             return unavailable to unavailable
         }
 
-        if (!hasAnyIpCheckResult(merged, unavailable)) {
+        if (!hasCompleteIpCheckResult(merged, unavailable)) {
             val fullConfigResult = V2rayConfigManager.getV2rayConfig(app, guid)
             if (fullConfigResult.status && fullConfigResult.content.isNotBlank()) {
                 collectFromConfig(fullConfigResult.content)
@@ -557,11 +567,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             !isUnavailableIpCheckValue(values["B"], unavailable)
     }
 
-    private fun hasAnyIpCheckResult(values: Map<String, String>, unavailable: String): Boolean {
-        return !isUnavailableIpCheckValue(values["A"], unavailable) ||
-            !isUnavailableIpCheckValue(values["B"], unavailable)
-    }
-
     private fun isUnavailableIpCheckValue(value: String?, unavailable: String): Boolean {
         val normalized = value?.trim().orEmpty()
         return normalized.isEmpty() ||
@@ -572,10 +577,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun resolveScopedIpChecksViaTemporaryCore(
         runtimeConfig: String,
         httpPortForChecks: Int
-    ): Map<String, String> {
+    ): Map<String, String> = coroutineScope {
         if (httpPortForChecks <= 0) {
-            return emptyMap()
+            return@coroutineScope emptyMap()
         }
+        val unavailable = localizedString(R.string.ip_check_unavailable)
 
         val controller = V2RayNativeManager.newCoreController(object : CoreCallbackHandler {
             override fun startup(): Long = 0
@@ -583,35 +589,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             override fun onEmitStatus(l: Long, s: String?): Long = 0
         })
 
-        return try {
+        try {
             controller.startLoop(runtimeConfig, 0)
             if (!waitForCoreRunning(controller)) {
-                return emptyMap()
+                return@coroutineScope emptyMap()
             }
+            waitForTemporaryProxyReady(httpPortForChecks)
 
-            var resolved = SpeedtestManager.getRemoteIpAndGeoInfoBySource(
-                httpPortOverride = httpPortForChecks,
-                fastMode = true
+            val merged = linkedMapOf<String, String>()
+            val pending = mutableListOf(
+                async(Dispatchers.IO) {
+                    SpeedtestManager.getRemoteIpAndGeoInfoBySource(
+                        httpPortOverride = httpPortForChecks,
+                        fastMode = true
+                    )
+                },
+                async(Dispatchers.IO) {
+                    SpeedtestManager.getRemoteIpAndGeoInfoBySource(
+                        httpPortOverride = httpPortForChecks,
+                        fastMode = false
+                    )
+                }
             )
-            if (!hasAnyUsableIpCheckValue(resolved)) {
-                delay(160L)
-                val retry = SpeedtestManager.getRemoteIpAndGeoInfoBySource(
-                    httpPortOverride = httpPortForChecks,
-                    fastMode = true
-                )
-                if (retry.isNotEmpty()) {
-                    val merged = linkedMapOf<String, String>()
-                    merged.putAll(resolved)
-                    retry.forEach { (source, value) ->
-                        val existing = merged[source]
-                        if (existing.isNullOrBlank() || existing.equals("unavailable", ignoreCase = true)) {
-                            merged[source] = value
+            try {
+                while (pending.isNotEmpty() && !hasCompleteIpCheckResult(merged, unavailable)) {
+                    val (finished, resolved) = select<Pair<Deferred<Map<String, String>>, Map<String, String>>> {
+                        pending.forEach { deferred ->
+                            deferred.onAwait { value -> deferred to value }
                         }
                     }
-                    resolved = merged
+                    pending.remove(finished)
+                    mergeScopedIpCheckResults(merged, resolved, unavailable)
                 }
+            } finally {
+                pending.forEach { it.cancel() }
             }
-            resolved.takeIf { it.isNotEmpty() } ?: emptyMap()
+
+            if (!hasCompleteIpCheckResult(merged, unavailable)) {
+                delay(140L)
+                val rescueResolved = SpeedtestManager.getRemoteIpAndGeoInfoBySource(
+                    httpPortOverride = httpPortForChecks,
+                    fastMode = false
+                )
+                mergeScopedIpCheckResults(merged, rescueResolved, unavailable)
+            }
+
+            merged.takeIf { it.isNotEmpty() } ?: emptyMap()
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to check scoped IP via temporary core", e)
             emptyMap()
@@ -626,9 +649,59 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun waitForTemporaryProxyReady(
+        httpPort: Int,
+        timeoutMs: Long = TEMP_PROXY_WARMUP_TIMEOUT_MS
+    ) {
+        if (httpPort <= 0 || timeoutMs <= 0L) {
+            return
+        }
+        val ipCheckUrlA = SettingsManager.getIpCheckUrlA()
+        val ipCheckUrlB = SettingsManager.getIpCheckUrlB()
+        val start = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - start < timeoutMs) {
+            val quickA = HttpUtil.getUrlContent(ipCheckUrlA, 450, httpPort)
+            if (!quickA.isNullOrBlank()) {
+                return
+            }
+            val quickB = HttpUtil.getUrlContent(ipCheckUrlB, 450, httpPort)
+            if (!quickB.isNullOrBlank()) {
+                return
+            }
+            delay(70L)
+        }
+    }
+
+    private fun preserveExistingIpCheckSummary(
+        guid: String,
+        ipA: String,
+        ipB: String,
+        unavailable: String
+    ): Pair<String, String> {
+        val existing = MmkvManager.decodeServerAffiliationInfo(guid)
+        val existingA = existing?.ipCheckA?.trim().orEmpty()
+        val existingB = existing?.ipCheckB?.trim().orEmpty()
+
+        val finalA = if (isUnavailableIpCheckValue(ipA, unavailable) &&
+            !isUnavailableIpCheckValue(existingA, unavailable)
+        ) {
+            existingA
+        } else {
+            ipA
+        }
+        val finalB = if (isUnavailableIpCheckValue(ipB, unavailable) &&
+            !isUnavailableIpCheckValue(existingB, unavailable)
+        ) {
+            existingB
+        } else {
+            ipB
+        }
+        return finalA to finalB
+    }
+
     private suspend fun waitForCoreRunning(
         controller: libv2ray.CoreController,
-        timeoutMs: Long = 1200L
+        timeoutMs: Long = 2200L
     ): Boolean {
         val start = SystemClock.elapsedRealtime()
         while (SystemClock.elapsedRealtime() - start < timeoutMs) {
@@ -638,13 +711,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             delay(60L)
         }
         return controller.isRunning
-    }
-
-    private fun hasAnyUsableIpCheckValue(values: Map<String, String>): Boolean {
-        return values.values.any { candidate ->
-            val normalized = candidate.trim()
-            normalized.isNotEmpty() && !normalized.equals("unavailable", ignoreCase = true)
-        }
     }
 
     private fun prepareRuntimeConfigForScopedIpCheck(configJson: String): Pair<String, Int>? {
@@ -1234,7 +1300,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val originalKeyword = keywordFilter
             val needRestore = savedSubId != null && (savedSubId != originalSubId || savedKeyword != originalKeyword)
             if (needRestore) {
-                subscriptionId = savedSubId!!
+                subscriptionId = savedSubId
                 keywordFilter = savedKeyword ?: originalKeyword
             }
 

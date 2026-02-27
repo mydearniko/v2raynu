@@ -27,13 +27,15 @@ import java.util.concurrent.ConcurrentHashMap
 object SpeedtestManager {
 
     private const val IP_CHECK_PARALLEL_ATTEMPTS = 2
-    private const val WHO_CHECK_PARALLEL_ATTEMPTS = 1
+    private const val WHO_CHECK_PARALLEL_ATTEMPTS = 2
     private const val IP_CHECK_TIMEOUT_MS = 2500
     private const val GEO_CHECK_TIMEOUT_MS = 3500
-    private const val FAST_IP_CHECK_PARALLEL_ATTEMPTS = 1
-    private const val FAST_WHO_CHECK_PARALLEL_ATTEMPTS = 1
-    private const val FAST_IP_CHECK_TIMEOUT_MS = 1200
-    private const val FAST_GEO_CHECK_TIMEOUT_MS = 1600
+    private const val FAST_IP_CHECK_PARALLEL_ATTEMPTS = 2
+    private const val FAST_WHO_CHECK_PARALLEL_ATTEMPTS = 2
+    private const val FAST_IP_CHECK_TIMEOUT_MS = 1700
+    private const val FAST_GEO_CHECK_TIMEOUT_MS = 2300
+    private const val WHO_RESCUE_TIMEOUT_DELTA_MS = 1200
+    private const val WHO_RESCUE_TIMEOUT_MAX_MS = 6500
     private const val WHO_SUMMARY_CACHE_TTL_MS = 2 * 60 * 1000L
     private const val WHO_SUMMARY_CACHE_MAX_ENTRIES = 1024
     private val IPV4_REGEX =
@@ -218,18 +220,20 @@ object SpeedtestManager {
     ): Map<String, String> = coroutineScope {
         val httpPort = httpPortOverride ?: SettingsManager.getHttpPort()
         val lookupConfig = if (fastMode) fastLookupConfig else defaultLookupConfig
+        val ipCheckUrlA = SettingsManager.getIpCheckUrlA()
+        val ipCheckUrlB = SettingsManager.getIpCheckUrlB()
 
         val pending = mutableListOf(
             async(Dispatchers.IO) {
                 "A" to resolveIpGeoSummary(
-                    ipCheckUrl = AppConfig.IP_CHECK_A_URL,
+                    ipCheckUrl = ipCheckUrlA,
                     httpPort = httpPort,
                     lookupConfig = lookupConfig
                 )
             },
             async(Dispatchers.IO) {
                 "B" to resolveIpGeoSummary(
-                    ipCheckUrl = AppConfig.IP_CHECK_B_URL,
+                    ipCheckUrl = ipCheckUrlB,
                     httpPort = httpPort,
                     lookupConfig = lookupConfig
                 )
@@ -260,11 +264,13 @@ object SpeedtestManager {
     ): Map<String, String> = coroutineScope {
         val httpPort = httpPortOverride ?: SettingsManager.getHttpPort()
         val lookupConfig = defaultLookupConfig
+        val ipCheckUrlA = SettingsManager.getIpCheckUrlA()
+        val ipCheckUrlB = SettingsManager.getIpCheckUrlB()
 
         val pending = mutableListOf(
             async(Dispatchers.IO) {
                 val ip = resolveRemoteIp(
-                    ipCheckUrl = AppConfig.IP_CHECK_A_URL,
+                    ipCheckUrl = ipCheckUrlA,
                     httpPort = httpPort,
                     lookupConfig = lookupConfig
                 )
@@ -272,7 +278,7 @@ object SpeedtestManager {
             },
             async(Dispatchers.IO) {
                 val ip = resolveRemoteIp(
-                    ipCheckUrl = AppConfig.IP_CHECK_B_URL,
+                    ipCheckUrl = ipCheckUrlB,
                     httpPort = httpPort,
                     lookupConfig = lookupConfig
                 )
@@ -326,19 +332,82 @@ object SpeedtestManager {
             return cached
         }
 
-        val whoUrl = AppConfig.GEOIP_CHECK_URL.replace("\$IP", Utils.urlEncode(ip))
-        val whoTasks = List(lookupConfig.whoParallelAttempts.coerceAtLeast(1)) {
-            suspend {
-                extractWhoLine(HttpUtil.getUrlContent(whoUrl, lookupConfig.geoTimeoutMs, httpPort))
-                    ?.takeIf { it.isNotBlank() }
+        val whoSummary = resolveWhoSummary(
+            ip = ip,
+            httpPort = httpPort,
+            lookupConfig = lookupConfig
+        ) ?: return "unavailable"
+        cacheWhoSummary(ip, whoSummary)
+        return whoSummary
+    }
+
+    private suspend fun resolveWhoSummary(
+        ip: String,
+        httpPort: Int,
+        lookupConfig: IpGeoLookupConfig
+    ): String? {
+        val whoUrl = SettingsManager.buildGeoIpCheckUrl(ip)
+        val attempts = lookupConfig.whoParallelAttempts.coerceAtLeast(1)
+
+        // Prefer direct who lookup (it only resolves IP metadata), but race proxied path too
+        // so servers with restrictive local routing still return results quickly.
+        val primaryTasks = buildWhoTasks(
+            whoUrl = whoUrl,
+            timeoutMs = lookupConfig.geoTimeoutMs,
+            attempts = attempts,
+            httpPort = httpPort
+        )
+        firstNonNullTasks(primaryTasks)?.let { return it }
+
+        val rescueTimeout = (lookupConfig.geoTimeoutMs + WHO_RESCUE_TIMEOUT_DELTA_MS)
+            .coerceAtMost(WHO_RESCUE_TIMEOUT_MAX_MS)
+        if (rescueTimeout <= lookupConfig.geoTimeoutMs) {
+            return null
+        }
+        val rescueTasks = buildWhoTasks(
+            whoUrl = whoUrl,
+            timeoutMs = rescueTimeout,
+            attempts = 1,
+            httpPort = httpPort
+        )
+        return firstNonNullTasks(rescueTasks)
+    }
+
+    private fun buildWhoTasks(
+        whoUrl: String,
+        timeoutMs: Int,
+        attempts: Int,
+        httpPort: Int
+    ): List<suspend () -> String?> {
+        val directAttempts = attempts.coerceAtLeast(1)
+        val tasks = mutableListOf<suspend () -> String?>()
+        if (!SettingsManager.isIpv6Disabled()) {
+            repeat(directAttempts) {
+                tasks.add {
+                    extractWhoLine(
+                        HttpUtil.getUrlContent(
+                            url = whoUrl,
+                            timeout = timeoutMs,
+                            httpPort = 0
+                        )
+                    )?.takeIf { line -> line.isNotBlank() }
+                }
             }
         }
-        val whoSummary = firstNonNullTasks(whoTasks)
-        val resolved = whoSummary ?: ip
-        if (!resolved.equals("unavailable", ignoreCase = true)) {
-            cacheWhoSummary(ip, resolved)
+        if (httpPort > 0) {
+            repeat(directAttempts) {
+                tasks.add {
+                    extractWhoLine(
+                        HttpUtil.getUrlContent(
+                            url = whoUrl,
+                            timeout = timeoutMs,
+                            httpPort = httpPort
+                        )
+                    )?.takeIf { line -> line.isNotBlank() }
+                }
+            }
         }
-        return resolved
+        return tasks
     }
 
     private suspend fun resolveRemoteIp(
@@ -346,6 +415,9 @@ object SpeedtestManager {
         httpPort: Int,
         lookupConfig: IpGeoLookupConfig
     ): String? {
+        if (httpPort <= 0 && SettingsManager.isIpv6Disabled()) {
+            return null
+        }
         val tasks = List(lookupConfig.ipParallelAttempts.coerceAtLeast(1)) {
             suspend {
                 extractFirstIp(
