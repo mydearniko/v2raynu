@@ -111,7 +111,9 @@ class V2RayVpnService : VpnService(), ServiceControl {
             stopAllService()
             return
         }
-        if (!V2RayServiceManager.startCoreLoop(vpnInterface)) {
+        if (!V2RayServiceManager.startCoreLoop(vpnInterface) {
+                runTun2socks()
+            }) {
             Log.e(AppConfig.TAG, "Failed to start V2Ray core loop")
             stopAllService()
             return
@@ -151,7 +153,6 @@ class V2RayVpnService : VpnService(), ServiceControl {
             return false
         }
 
-        runTun2socks()
         return true
     }
 
@@ -316,6 +317,9 @@ class V2RayVpnService : VpnService(), ServiceControl {
      * Starts the tun2socks process with the appropriate parameters.
      */
     private fun runTun2socks() {
+        if (tun2SocksService != null) {
+            return
+        }
         val vpnInterface = mInterface ?: return
 
         if (SettingsManager.isUsingHevTun()) {

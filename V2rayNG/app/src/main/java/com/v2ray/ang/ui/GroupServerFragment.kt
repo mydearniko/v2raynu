@@ -23,6 +23,8 @@ import com.v2ray.ang.extension.toastError
 import com.v2ray.ang.extension.toastSuccess
 import com.v2ray.ang.handler.AngConfigManager
 import com.v2ray.ang.handler.MmkvManager
+import com.v2ray.ang.handler.V2RayServiceManager
+import com.v2ray.ang.handler.V2rayConfigManager
 import com.v2ray.ang.helper.SimpleItemTouchHelperCallback
 import com.v2ray.ang.viewmodel.MainViewModel
 import kotlinx.coroutines.Dispatchers
@@ -229,7 +231,11 @@ class GroupServerFragment : BaseFragment<FragmentGroupServerBinding>() {
             adapter.setSelectServer(fromPosition, toPosition)
 
             if (mainViewModel.isRunning.value == true) {
-                ownerActivity.restartV2Ray()
+                V2RayServiceManager.restartVService(ownerActivity)
+            } else {
+                ownerActivity.lifecycleScope.launch(Dispatchers.IO) {
+                    V2rayConfigManager.warmupV2rayConfig(ownerActivity.applicationContext, guid)
+                }
             }
         }
     }

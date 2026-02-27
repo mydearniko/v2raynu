@@ -188,6 +188,7 @@ object AppConfig {
 
     /** Give a good name to this, IDK*/
     const val VPN = "VPN"
+    const val PROXY_ONLY = "Proxy only"
     const val VPN_MTU = 1500
 
     /** hev-sock5-tunnel read-write-timeout value */

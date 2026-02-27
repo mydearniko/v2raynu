@@ -17,6 +17,7 @@ import com.v2ray.ang.AppConfig
 import com.v2ray.ang.R
 import com.v2ray.ang.dto.GroupMapItem
 import com.v2ray.ang.dto.RealPingResult
+import com.v2ray.ang.dto.ServerAffiliationInfo
 import com.v2ray.ang.dto.ServersCache
 import com.v2ray.ang.dto.SubscriptionCache
 import com.v2ray.ang.extension.serializable
@@ -32,20 +33,27 @@ import com.v2ray.ang.handler.V2rayConfigManager
 import com.v2ray.ang.service.RealPingBatchStore
 import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.MessageUtil
+import com.v2ray.ang.util.MyContextWrapper
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import libv2ray.CoreCallbackHandler
 import java.util.Collections
 import java.util.Locale
+import java.net.ServerSocket
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -67,6 +75,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var delayCheckRequestedAtMs = 0L
     private var standaloneDelayCheckJob: Job? = null
     private val standaloneDelayGeneration = AtomicLong(0L)
+    private var scopeIpCheckJob: Job? = null
+    private val scopeIpCheckGeneration = AtomicLong(0L)
+
+    private fun localizedContext(): Context {
+        val app = getApplication<AngApplication>()
+        return MyContextWrapper.wrap(app, SettingsManager.getLocale())
+    }
+
+    private fun localizedString(resId: Int, vararg args: Any): String {
+        val ctx = localizedContext()
+        return if (args.isEmpty()) {
+            ctx.getString(resId)
+        } else {
+            ctx.getString(resId, *args)
+        }
+    }
 
     private fun requestDelayCheck() {
         delayCheckRequestedAtMs = SystemClock.elapsedRealtime()
@@ -96,6 +120,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         standaloneDelayGeneration.incrementAndGet()
         standaloneDelayCheckJob?.cancel()
         standaloneDelayCheckJob = null
+        scopeIpCheckGeneration.incrementAndGet()
+        scopeIpCheckJob?.cancel()
+        scopeIpCheckJob = null
         SpeedtestManager.closeAllTcpSockets()
         MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_MEASURE_DELAY_CANCEL, "")
         MessageUtil.sendMsg2TestService(getApplication(), AppConfig.MSG_MEASURE_CONFIG_CANCEL, "")
@@ -233,8 +260,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     @Synchronized
     private fun getScopedServerSnapshot(): List<ServersCache> {
-        serverList = MmkvManager.decodeServerList()
-        updateCache()
+        // Fast path: actions should operate on the current UI scope without forcing a global reload.
+        // This avoids re-reading all profiles from storage for every menu action.
+        if (serversCache.isEmpty() && serverList.isNotEmpty()) {
+            updateCache()
+        }
         return serversCache.toList()
     }
 
@@ -242,7 +272,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * Returns a stable snapshot of GUIDs in the current action scope.
      */
     private fun getScopedGuidSnapshot(): List<String> {
-        return getScopedServerSnapshot().map { it.guid }
+        val scopedServers = getScopedServerSnapshot()
+        val guids = ArrayList<String>(scopedServers.size)
+        for (item in scopedServers) {
+            guids.add(item.guid)
+        }
+        return guids
     }
 
     private fun matchesKeyword(profile: com.v2ray.ang.dto.ProfileItem, keyword: String): Boolean {
@@ -371,6 +406,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     /**
+     * Checks remote IP A/B for all currently working servers in the active scope.
+     *
+     * Scope follows active group + keyword filter.
+     * Only servers with at least one successful delay sample are checked.
+     */
+    fun checkWorkingServersIpAAndBInScope(): Int {
+        val targetGuids = getScopedGuidSnapshot().filter { guid ->
+            isServerWorkingForIpCheck(MmkvManager.decodeServerAffiliationInfo(guid))
+        }
+
+        scopeIpCheckGeneration.incrementAndGet()
+        scopeIpCheckJob?.cancel()
+        scopeIpCheckJob = null
+
+        if (targetGuids.isEmpty()) {
+            updateTestResultAction.value = localizedString(R.string.ip_check_no_working_server_scope)
+            return 0
+        }
+
+        val generation = scopeIpCheckGeneration.get()
+        val total = targetGuids.size
+        val configuredThreadCount = SettingsManager.getRealPingThreadCount().coerceAtLeast(1)
+        val workerCount = minOf(
+            configuredThreadCount,
+            total.coerceAtLeast(1),
+            MAX_SCOPED_IP_CHECK_WORKERS
+        )
+        scopeIpCheckJob = viewModelScope.launch(Dispatchers.IO) {
+            updateTestResultAction.postValue(localizedString(R.string.ip_check_progress, 0, total))
+            val completionCount = AtomicInteger(0)
+            val semaphore = Semaphore(workerCount)
+            val workers = targetGuids.map { guid ->
+                async {
+                    semaphore.withPermit {
+                        if (!isActive || generation != scopeIpCheckGeneration.get()) {
+                            return@withPermit
+                        }
+
+                        val (ipA, ipB) = fetchServerIpChecksForGuid(guid, generation)
+                        if (!isActive || generation != scopeIpCheckGeneration.get()) {
+                            return@withPermit
+                        }
+
+                        MmkvManager.encodeServerIpCheckSummary(guid, ipA, ipB)
+                        val completed = completionCount.incrementAndGet()
+                        withContext(Dispatchers.Main) {
+                            updateListAction.value = getPosition(guid)
+                        }
+                        updateTestResultAction.postValue(localizedString(R.string.ip_check_progress, completed, total))
+                    }
+                }
+            }
+            workers.awaitAll()
+
+            if (isActive && generation == scopeIpCheckGeneration.get()) {
+                updateTestResultAction.postValue(localizedString(R.string.ip_check_done, total))
+            }
+        }
+        return total
+    }
+
+    /**
      * Tests the real ping for the current server.
      */
     fun testCurrentServerRealPing() {
@@ -384,6 +481,217 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         private const val PARALLEL_DELAY_ATTEMPTS = 3
+        private const val MAX_SCOPED_IP_CHECK_WORKERS = 8
+    }
+
+    private fun isServerWorkingForIpCheck(aff: ServerAffiliationInfo?): Boolean {
+        val samples = aff?.testDelaySamples.orEmpty()
+        if (samples.isNotEmpty()) {
+            return samples.any { it >= 0L }
+        }
+        return (aff?.testDelayMillis ?: 0L) > 0L
+    }
+
+    private suspend fun fetchServerIpChecksForGuid(guid: String, generation: Long): Pair<String, String> {
+        val app = getApplication<AngApplication>()
+        val unavailable = localizedString(R.string.ip_check_unavailable)
+        if (generation != scopeIpCheckGeneration.get()) {
+            return unavailable to unavailable
+        }
+
+        V2RayNativeManager.initCoreEnv(app)
+
+        val merged = linkedMapOf<String, String>()
+        suspend fun collectFromConfig(configContent: String) {
+            val runtimeCandidate = prepareRuntimeConfigForScopedIpCheck(configContent) ?: return
+            if (generation != scopeIpCheckGeneration.get() || hasCompleteIpCheckResult(merged, unavailable)) {
+                return
+            }
+            val resolved = resolveScopedIpChecksViaTemporaryCore(
+                runtimeConfig = runtimeCandidate.first,
+                httpPortForChecks = runtimeCandidate.second
+            )
+            mergeScopedIpCheckResults(merged, resolved, unavailable)
+        }
+
+        val fastConfigResult = V2rayConfigManager.getV2rayConfig4Speedtest(app, guid)
+        if (fastConfigResult.status && fastConfigResult.content.isNotBlank()) {
+            collectFromConfig(fastConfigResult.content)
+        }
+
+        if (generation != scopeIpCheckGeneration.get()) {
+            return unavailable to unavailable
+        }
+
+        if (!hasAnyIpCheckResult(merged, unavailable)) {
+            val fullConfigResult = V2rayConfigManager.getV2rayConfig(app, guid)
+            if (fullConfigResult.status && fullConfigResult.content.isNotBlank()) {
+                collectFromConfig(fullConfigResult.content)
+            }
+        }
+
+        val ipA = merged["A"]?.trim().orEmpty().ifEmpty { unavailable }
+        val ipB = merged["B"]?.trim().orEmpty().ifEmpty { unavailable }
+        return ipA to ipB
+    }
+
+    private fun mergeScopedIpCheckResults(
+        target: MutableMap<String, String>,
+        incoming: Map<String, String>,
+        unavailable: String
+    ) {
+        listOf("A", "B").forEach { source ->
+            val candidate = incoming[source]?.trim().orEmpty()
+            if (isUnavailableIpCheckValue(candidate, unavailable)) {
+                return@forEach
+            }
+            val existing = target[source]
+            if (isUnavailableIpCheckValue(existing, unavailable)) {
+                target[source] = candidate
+            }
+        }
+    }
+
+    private fun hasCompleteIpCheckResult(values: Map<String, String>, unavailable: String): Boolean {
+        return !isUnavailableIpCheckValue(values["A"], unavailable) &&
+            !isUnavailableIpCheckValue(values["B"], unavailable)
+    }
+
+    private fun hasAnyIpCheckResult(values: Map<String, String>, unavailable: String): Boolean {
+        return !isUnavailableIpCheckValue(values["A"], unavailable) ||
+            !isUnavailableIpCheckValue(values["B"], unavailable)
+    }
+
+    private fun isUnavailableIpCheckValue(value: String?, unavailable: String): Boolean {
+        val normalized = value?.trim().orEmpty()
+        return normalized.isEmpty() ||
+            normalized.equals(unavailable, ignoreCase = true) ||
+            normalized.equals("unavailable", ignoreCase = true)
+    }
+
+    private suspend fun resolveScopedIpChecksViaTemporaryCore(
+        runtimeConfig: String,
+        httpPortForChecks: Int
+    ): Map<String, String> {
+        if (httpPortForChecks <= 0) {
+            return emptyMap()
+        }
+
+        val controller = V2RayNativeManager.newCoreController(object : CoreCallbackHandler {
+            override fun startup(): Long = 0
+            override fun shutdown(): Long = 0
+            override fun onEmitStatus(l: Long, s: String?): Long = 0
+        })
+
+        return try {
+            controller.startLoop(runtimeConfig, 0)
+            if (!waitForCoreRunning(controller)) {
+                return emptyMap()
+            }
+
+            var resolved = SpeedtestManager.getRemoteIpAndGeoInfoBySource(
+                httpPortOverride = httpPortForChecks,
+                fastMode = true
+            )
+            if (!hasAnyUsableIpCheckValue(resolved)) {
+                delay(160L)
+                val retry = SpeedtestManager.getRemoteIpAndGeoInfoBySource(
+                    httpPortOverride = httpPortForChecks,
+                    fastMode = true
+                )
+                if (retry.isNotEmpty()) {
+                    val merged = linkedMapOf<String, String>()
+                    merged.putAll(resolved)
+                    retry.forEach { (source, value) ->
+                        val existing = merged[source]
+                        if (existing.isNullOrBlank() || existing.equals("unavailable", ignoreCase = true)) {
+                            merged[source] = value
+                        }
+                    }
+                    resolved = merged
+                }
+            }
+            resolved.takeIf { it.isNotEmpty() } ?: emptyMap()
+        } catch (e: Exception) {
+            Log.e(AppConfig.TAG, "Failed to check scoped IP via temporary core", e)
+            emptyMap()
+        } finally {
+            runCatching {
+                if (controller.isRunning) {
+                    controller.stopLoop()
+                }
+            }.onFailure { err ->
+                Log.e(AppConfig.TAG, "Failed to stop temporary core for scoped IP checks", err)
+            }
+        }
+    }
+
+    private suspend fun waitForCoreRunning(
+        controller: libv2ray.CoreController,
+        timeoutMs: Long = 1200L
+    ): Boolean {
+        val start = SystemClock.elapsedRealtime()
+        while (SystemClock.elapsedRealtime() - start < timeoutMs) {
+            if (controller.isRunning) {
+                return true
+            }
+            delay(60L)
+        }
+        return controller.isRunning
+    }
+
+    private fun hasAnyUsableIpCheckValue(values: Map<String, String>): Boolean {
+        return values.values.any { candidate ->
+            val normalized = candidate.trim()
+            normalized.isNotEmpty() && !normalized.equals("unavailable", ignoreCase = true)
+        }
+    }
+
+    private fun prepareRuntimeConfigForScopedIpCheck(configJson: String): Pair<String, Int>? {
+        val stripped = stripTunInbound(configJson)
+        val root = JsonUtil.parseString(stripped) ?: return null
+        val httpPort = findAvailableLoopbackPort()
+        if (httpPort <= 0) {
+            return null
+        }
+
+        val existingInbounds = root.getAsJsonArray("inbounds")
+        var preservedTag = "socks"
+        if (existingInbounds != null) {
+            for (index in 0 until existingInbounds.size()) {
+                val inboundObj = existingInbounds[index]?.asJsonObject ?: continue
+                val protocol = inboundObj.get("protocol")?.asString?.lowercase().orEmpty()
+                val tag = inboundObj.get("tag")?.asString?.trim().orEmpty()
+                if (protocol != "tun" && tag.lowercase() != "tun") {
+                    if (tag.isNotEmpty()) {
+                        preservedTag = tag
+                    }
+                    break
+                }
+            }
+        }
+
+        val inbounds = com.google.gson.JsonArray()
+        val inbound = com.google.gson.JsonObject().apply {
+            addProperty("tag", preservedTag)
+            addProperty("listen", AppConfig.LOOPBACK)
+            addProperty("port", httpPort)
+            addProperty("protocol", "http")
+            add("settings", com.google.gson.JsonObject())
+        }
+        inbounds.add(inbound)
+        root.add("inbounds", inbounds)
+
+        return JsonUtil.toJson(root) to httpPort
+    }
+
+    private fun findAvailableLoopbackPort(): Int {
+        return runCatching {
+            ServerSocket(0).use { socket ->
+                socket.reuseAddress = true
+                socket.localPort
+            }
+        }.getOrDefault(0)
     }
 
     private fun testCurrentServerDelayWithoutService() {
@@ -393,7 +701,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val app = getApplication<AngApplication>()
             val selectedGuid = MmkvManager.getSelectServer()
             if (selectedGuid.isNullOrBlank()) {
-                updateTestResultAction.postValue(app.getString(R.string.connection_not_connected))
+                updateTestResultAction.postValue(localizedString(R.string.connection_not_connected))
                 return@launch
             }
 
@@ -406,7 +714,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val configResult = V2rayConfigManager.getV2rayConfig4Speedtest(app, selectedGuid)
                 if (!configResult.status || configResult.content.isBlank()) {
                     if (generation == standaloneDelayGeneration.get()) {
-                        updateTestResultAction.postValue(app.getString(R.string.connection_test_fail))
+                        updateTestResultAction.postValue(localizedString(R.string.connection_test_fail))
                     }
                     return@launch
                 }
@@ -450,9 +758,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 val result = if (delayMillis >= 0L) {
-                    app.getString(R.string.connection_test_available, delayMillis)
+                    localizedString(R.string.connection_test_available, delayMillis)
                 } else {
-                    app.getString(R.string.connection_test_fail)
+                    localizedString(R.string.connection_test_fail)
                 }
                 updateTestResultAction.postValue(result)
 
@@ -477,7 +785,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 Log.e(AppConfig.TAG, "Standalone delay check failed", e)
                 if (generation == standaloneDelayGeneration.get()) {
                     updateTestResultAction.postValue(
-                        app.getString(R.string.connection_test_error, e.message ?: "unknown")
+                        localizedString(R.string.connection_test_error, e.message ?: "unknown")
                     )
                 }
             }
@@ -494,19 +802,77 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         val app = getApplication<AngApplication>()
-        val configResult = V2rayConfigManager.getV2rayConfig(app, selectedGuid)
-        if (!configResult.status || configResult.content.isBlank()) {
-            return SpeedtestManager.getRemoteIpAndGeoInfoSummary(
-                onPartialUpdate = { partial ->
-                    if (generation == standaloneDelayGeneration.get()) {
-                        onPartialUpdate(partial)
-                    }
-                },
-                httpPortOverride = 0
-            )
+        V2RayNativeManager.initCoreEnv(app)
+        val configCandidates = linkedSetOf<String>()
+        val fastConfigResult = V2rayConfigManager.getV2rayConfig4Speedtest(app, selectedGuid)
+        if (fastConfigResult.status && fastConfigResult.content.isNotBlank()) {
+            configCandidates.add(fastConfigResult.content)
+        }
+        val fullConfigResult = V2rayConfigManager.getV2rayConfig(app, selectedGuid)
+        if (fullConfigResult.status && fullConfigResult.content.isNotBlank()) {
+            configCandidates.add(fullConfigResult.content)
         }
 
-        val runtimeConfig = stripTunInbound(configResult.content)
+        var bestUnavailableSummary: String? = null
+        for (configContent in configCandidates) {
+            if (generation != standaloneDelayGeneration.get()) {
+                return null
+            }
+
+            val runtimeCandidates = mutableListOf<Pair<String, Int>>()
+            prepareRuntimeConfigForScopedIpCheck(configContent)?.let { runtimeCandidates.add(it) }
+            runtimeCandidates.add(stripTunInbound(configContent) to SettingsManager.getHttpPort())
+
+            for ((runtimeConfig, httpPortForChecks) in runtimeCandidates.distinct()) {
+                if (generation != standaloneDelayGeneration.get()) {
+                    return null
+                }
+                val summary = resolveStandaloneIpGeoSummaryViaTemporaryCore(
+                    runtimeConfig = runtimeConfig,
+                    httpPortForChecks = httpPortForChecks,
+                    generation = generation,
+                    onPartialUpdate = onPartialUpdate
+                )
+                if (summary.isNullOrBlank()) {
+                    continue
+                }
+                if (isUsableStandaloneIpGeoSummary(summary)) {
+                    return summary
+                }
+                if (bestUnavailableSummary.isNullOrBlank()) {
+                    bestUnavailableSummary = summary
+                }
+            }
+        }
+
+        val directSummary = SpeedtestManager.getRemoteIpAndGeoInfoSummary(
+            onPartialUpdate = { partial ->
+                if (generation == standaloneDelayGeneration.get()) {
+                    onPartialUpdate(partial)
+                }
+            },
+            httpPortOverride = 0
+        )
+        if (!directSummary.isNullOrBlank()) {
+            if (isUsableStandaloneIpGeoSummary(directSummary)) {
+                return directSummary
+            }
+            if (bestUnavailableSummary.isNullOrBlank()) {
+                bestUnavailableSummary = directSummary
+            }
+        }
+        return bestUnavailableSummary
+    }
+
+    private suspend fun resolveStandaloneIpGeoSummaryViaTemporaryCore(
+        runtimeConfig: String,
+        httpPortForChecks: Int,
+        generation: Long,
+        onPartialUpdate: (String) -> Unit
+    ): String? {
+        if (httpPortForChecks <= 0) {
+            return null
+        }
         val controller = V2RayNativeManager.newCoreController(object : CoreCallbackHandler {
             override fun startup(): Long = 0
             override fun shutdown(): Long = 0
@@ -515,25 +881,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         return try {
             controller.startLoop(runtimeConfig, 0)
-            val httpPort = if (controller.isRunning) SettingsManager.getHttpPort() else 0
-            SpeedtestManager.getRemoteIpAndGeoInfoSummary(
-                onPartialUpdate = { partial ->
-                    if (generation == standaloneDelayGeneration.get()) {
-                        onPartialUpdate(partial)
-                    }
-                },
-                httpPortOverride = httpPort
-            )
+            if (!waitForCoreRunning(controller)) {
+                null
+            } else {
+                SpeedtestManager.getRemoteIpAndGeoInfoSummary(
+                    onPartialUpdate = { partial ->
+                        if (generation == standaloneDelayGeneration.get()) {
+                            onPartialUpdate(partial)
+                        }
+                    },
+                    httpPortOverride = httpPortForChecks
+                )
+            }
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to start temporary core for standalone IP checks", e)
-            SpeedtestManager.getRemoteIpAndGeoInfoSummary(
-                onPartialUpdate = { partial ->
-                    if (generation == standaloneDelayGeneration.get()) {
-                        onPartialUpdate(partial)
-                    }
-                },
-                httpPortOverride = 0
-            )
+            null
         } finally {
             runCatching {
                 if (controller.isRunning) {
@@ -543,6 +905,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 Log.e(AppConfig.TAG, "Failed to stop temporary core for standalone IP checks", err)
             }
         }
+    }
+
+    private fun isUsableStandaloneIpGeoSummary(summary: String): Boolean {
+        val unavailable = localizedString(R.string.ip_check_unavailable)
+        return summary
+            .lineSequence()
+            .map { it.trim() }
+            .any { line ->
+                line.isNotEmpty() &&
+                    !line.equals(unavailable, ignoreCase = true) &&
+                    !line.equals("unavailable", ignoreCase = true)
+            }
     }
 
     private fun stripTunInbound(configJson: String): String {
@@ -564,7 +938,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun startServiceBackedDelayCheck(showTestingState: Boolean) {
         if (showTestingState) {
-            updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_test_testing)
+            updateTestResultAction.value = localizedString(R.string.connection_test_testing)
         }
         isDelayCheckPending = true
         MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_REGISTER_CLIENT, "")
@@ -577,7 +951,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             MessageUtil.sendMsg2Service(getApplication(), AppConfig.MSG_MEASURE_DELAY_CANCEL, "")
             clearDelayCheckPending()
-            updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_test_fail)
+            updateTestResultAction.value = localizedString(R.string.connection_test_fail)
         }
     }
 
@@ -636,22 +1010,77 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     /**
      * Removes duplicate servers by address (ignoring port/protocol/settings).
+     * Keeps the healthiest candidate per duplicate-address group when possible.
      * @return The number of removed servers.
      */
     fun removeDuplicateServer(): Int {
         val scopedServers = getScopedServerSnapshot()
-        val deleteServer = mutableListOf<String>()
-        val seenAddress = hashSetOf<String>()
+        data class DuplicateCandidate(
+            val guid: String,
+            val originalIndex: Int,
+            val successCount: Int,
+            val bestLatencyMillis: Long,
+            val allFailures: Boolean
+        )
 
-        for (item in scopedServers) {
-            val guid = item.guid
-            val addressKey = normalizeServerAddressForDuplicateCheck(
-                item.profile.server
-            ) ?: continue
-            if (!seenAddress.add(addressKey)) {
-                deleteServer.add(guid)
+        val groupedByAddress = HashMap<String, MutableList<DuplicateCandidate>>(scopedServers.size.coerceAtLeast(16))
+        scopedServers.forEachIndexed { index, item ->
+            val addressKey = normalizeServerAddressForDuplicateCheck(item.profile.server) ?: return@forEachIndexed
+            val aff = MmkvManager.decodeServerAffiliationInfo(item.guid)
+            val samples = aff?.testDelaySamples.orEmpty()
+            val validSamples = samples.filter { it >= 0L }
+            val successCount = if (samples.isNotEmpty()) {
+                validSamples.size
+            } else if ((aff?.testDelayMillis ?: 0L) > 0L) {
+                1
+            } else {
+                0
+            }
+            val bestLatencyMillis = when {
+                validSamples.isNotEmpty() -> validSamples.minOrNull() ?: Long.MAX_VALUE
+                (aff?.testDelayMillis ?: 0L) > 0L -> aff?.testDelayMillis ?: Long.MAX_VALUE
+                else -> Long.MAX_VALUE
+            }
+            val allFailures = when {
+                samples.isNotEmpty() -> validSamples.isEmpty()
+                else -> (aff?.testDelayMillis ?: 0L) < 0L
+            }
+
+            groupedByAddress.getOrPut(addressKey) { mutableListOf() }
+                .add(
+                    DuplicateCandidate(
+                        guid = item.guid,
+                        originalIndex = index,
+                        successCount = successCount,
+                        bestLatencyMillis = bestLatencyMillis,
+                        allFailures = allFailures
+                    )
+                )
+        }
+
+        val deleteServer = mutableListOf<String>()
+        groupedByAddress.values.forEach { candidates ->
+            if (candidates.size <= 1) {
+                return@forEach
+            }
+
+            val keep = candidates
+                .sortedWith(
+                    compareByDescending<DuplicateCandidate> { it.successCount > 0 }
+                        .thenByDescending { it.successCount }
+                        .thenBy { it.allFailures }
+                        .thenBy { it.bestLatencyMillis }
+                        .thenBy { it.originalIndex }
+                )
+                .firstOrNull() ?: return@forEach
+
+            candidates.forEach { candidate ->
+                if (candidate.guid != keep.guid) {
+                    deleteServer.add(candidate.guid)
+                }
             }
         }
+
         return MmkvManager.removeServers(deleteServer)
     }
 
@@ -842,7 +1271,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     updateRunningState(false)
                     if (isDelayCheckPending) {
                         clearDelayCheckPending()
-                        updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_not_connected)
+                        updateTestResultAction.value = localizedString(R.string.connection_not_connected)
                     }
                 }
 
@@ -861,7 +1290,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     updateRunningState(false)
                     if (isDelayCheckPending) {
                         clearDelayCheckPending()
-                        updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_not_connected)
+                        updateTestResultAction.value = localizedString(R.string.connection_not_connected)
                     }
                 }
 
@@ -869,7 +1298,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     updateRunningState(false)
                     if (isDelayCheckPending) {
                         clearDelayCheckPending()
-                        updateTestResultAction.value = getApplication<AngApplication>().getString(R.string.connection_not_connected)
+                        updateTestResultAction.value = localizedString(R.string.connection_not_connected)
                     }
                 }
 

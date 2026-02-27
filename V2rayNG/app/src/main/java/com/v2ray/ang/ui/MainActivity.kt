@@ -197,6 +197,24 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
         }
     }
 
+    private fun quickSwitchMode() {
+        val nextMode = if (SettingsManager.isVpnMode()) AppConfig.PROXY_ONLY else AppConfig.VPN
+        MmkvManager.encodeSettings(AppConfig.PREF_MODE, nextMode)
+        invalidateOptionsMenu()
+
+        if (mainViewModel.isRunning.value == true) {
+            restartV2Ray()
+        }
+    }
+
+    private fun getQuickSwitchModeTitleResId(): Int {
+        return if (SettingsManager.isVpnMode()) {
+            R.string.title_switch_to_proxy_mode
+        } else {
+            R.string.title_switch_to_vpn_mode
+        }
+    }
+
     private fun setTestState(content: String?) {
         binding.tvTestState.text = content
         binding.layoutTest.post { updateFabBottomMargin() }
@@ -251,6 +269,7 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
         menuInflater.inflate(R.menu.menu_main, menu)
+        menu.findItem(R.id.quick_switch_mode)?.setTitle(getQuickSwitchModeTitleResId())
 
         val searchItem = menu.findItem(R.id.search_view)
         if (searchItem != null) {
@@ -366,12 +385,6 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
             true
         }
 
-        R.id.export_all -> {
-            syncActionScopeToSelectedGroup()
-            exportAll()
-            true
-        }
-
         R.id.ping_all -> {
             syncActionScopeToSelectedGroup()
             val targetCount = mainViewModel.testAllTcping()
@@ -386,8 +399,19 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
             true
         }
 
-        R.id.service_restart -> {
-            restartV2Ray()
+        R.id.check_ips_working_scope -> {
+            syncActionScopeToSelectedGroup()
+            val targetCount = mainViewModel.checkWorkingServersIpAAndBInScope()
+            if (targetCount > 0) {
+                toast(getString(R.string.ip_check_scope_count, targetCount))
+            } else {
+                toast(R.string.ip_check_no_working_server_scope)
+            }
+            true
+        }
+
+        R.id.quick_switch_mode -> {
+            quickSwitchMode()
             true
         }
 
@@ -400,12 +424,6 @@ class MainActivity : HelperBaseActivity(), NavigationView.OnNavigationItemSelect
         R.id.del_duplicate_config -> {
             syncActionScopeToSelectedGroup()
             delDuplicateConfig()
-            true
-        }
-
-        R.id.del_invalid_config -> {
-            syncActionScopeToSelectedGroup()
-            delInvalidConfig()
             true
         }
 

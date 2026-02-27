@@ -127,12 +127,10 @@ object V2RayNativeManager {
         if (payload.isNullOrBlank()) {
             return null
         }
-        val parts = payload.split(',')
-        if (parts.isEmpty()) {
-            return null
-        }
-
-        val parsed = parts.mapNotNull { it.trim().toLongOrNull() }
+        val parsed = Regex("-?\\d+")
+            .findAll(payload)
+            .mapNotNull { it.value.toLongOrNull() }
+            .toList()
         if (parsed.isEmpty()) {
             return null
         }

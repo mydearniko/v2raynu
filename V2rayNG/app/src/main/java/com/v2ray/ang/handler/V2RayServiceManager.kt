@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.v2ray.ang.AppConfig
@@ -17,18 +18,26 @@ import com.v2ray.ang.contracts.ServiceControl
 import com.v2ray.ang.service.V2RayProxyOnlyService
 import com.v2ray.ang.service.V2RayVpnService
 import com.v2ray.ang.util.MessageUtil
+import com.v2ray.ang.util.MyContextWrapper
 import com.v2ray.ang.util.Utils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import libv2ray.CoreCallbackHandler
 import libv2ray.CoreController
 import java.lang.ref.SoftReference
+import java.net.HttpURLConnection
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.URL
+import java.util.LinkedHashSet
 import java.util.concurrent.atomic.AtomicLong
 
 object V2RayServiceManager {
@@ -37,8 +46,21 @@ object V2RayServiceManager {
     private val mMsgReceive = ReceiveMessageHandler()
     private var currentConfig: ProfileItem? = null
     private val delayMeasureGeneration = AtomicLong(0L)
+    private val restartGeneration = AtomicLong(0L)
+    private val startLoopGeneration = AtomicLong(0L)
     @Volatile
     private var delayMeasureJob: Job? = null
+    @Volatile
+    private var restartJob: Job? = null
+    @Volatile
+    private var startLoopJob: Job? = null
+    private const val CORE_RESTART_POLL_INTERVAL_MS = 25L
+    private const val CORE_RESTART_TIMEOUT_MS = 8_000L
+    private const val TRAFFIC_READY_CONNECT_TIMEOUT_MS = 900
+    private const val TRAFFIC_READY_READ_TIMEOUT_MS = 900
+    private const val TRAFFIC_READY_ATTEMPTS = 2
+    private const val TRAFFIC_READY_RETRY_DELAY_MS = 120L
+    private const val TRAFFIC_READY_EXTRA_PROBE_URL = "https://cp.cloudflare.com/generate_204"
 
     var serviceControl: SoftReference<ServiceControl>? = null
         set(value) {
@@ -73,11 +95,20 @@ object V2RayServiceManager {
     }
 
     /**
+     * Restarts only the core loop of the currently active service.
+     * This avoids full service teardown when only the selected server changed.
+     */
+    fun restartVService(context: Context) {
+        MessageUtil.sendMsg2Service(context, AppConfig.MSG_STATE_RESTART, "")
+    }
+
+    /**
      * Stops the V2Ray service.
      * @param context The context from which the service is stopped.
      */
     fun stopVService(context: Context) {
         //context.toast(R.string.toast_services_stop)
+        cancelPendingRestart()
         MessageUtil.sendMsg2Service(context, AppConfig.MSG_STATE_STOP, "")
     }
 
@@ -99,6 +130,7 @@ object V2RayServiceManager {
      * @param context The context from which the service is started.
      */
     private fun startContextService(context: Context) {
+        cancelPendingRestart()
         if (coreController.isRunning) {
             return
         }
@@ -125,22 +157,79 @@ object V2RayServiceManager {
         ContextCompat.startForegroundService(context, intent)
     }
 
+    private fun cancelPendingRestart() {
+        restartGeneration.incrementAndGet()
+        restartJob?.cancel()
+        restartJob = null
+    }
+
+    private fun cancelPendingStartLoop() {
+        startLoopGeneration.incrementAndGet()
+        startLoopJob?.cancel()
+        startLoopJob = null
+    }
+
+    private fun restartCoreLoopAsync(serviceControl: ServiceControl) {
+        val generation = restartGeneration.incrementAndGet()
+        restartJob?.cancel()
+        restartJob = CoroutineScope(Dispatchers.Default).launch {
+            stopCoreLoop()
+
+            val deadline = SystemClock.elapsedRealtime() + CORE_RESTART_TIMEOUT_MS
+            while (coreController.isRunning && SystemClock.elapsedRealtime() < deadline) {
+                if (!isActive || generation != restartGeneration.get()) {
+                    return@launch
+                }
+                delay(CORE_RESTART_POLL_INTERVAL_MS)
+            }
+
+            if (!isActive || generation != restartGeneration.get()) {
+                return@launch
+            }
+
+            if (coreController.isRunning) {
+                runCatching {
+                    coreController.stopLoop()
+                }.onFailure { e ->
+                    Log.e(AppConfig.TAG, "Failed to force-stop core loop during restart", e)
+                }
+            }
+
+            if (!isActive || generation != restartGeneration.get()) {
+                return@launch
+            }
+
+            runCatching {
+                serviceControl.startService()
+            }.onFailure { e ->
+                Log.e(AppConfig.TAG, "Failed to restart core loop", e)
+                runCatching {
+                    MessageUtil.sendMsg2UI(serviceControl.getService(), AppConfig.MSG_STATE_START_FAILURE, "")
+                }
+            }
+
+            if (generation == restartGeneration.get()) {
+                restartJob = null
+            }
+        }
+    }
+
     /**
      * Refer to the official documentation for [registerReceiver](https://developer.android.com/reference/androidx/core/content/ContextCompat#registerReceiver(android.content.Context,android.content.BroadcastReceiver,android.content.IntentFilter,int):
      * `registerReceiver(Context, BroadcastReceiver, IntentFilter, int)`.
      * Starts the V2Ray core service.
      */
-    fun startCoreLoop(vpnInterface: ParcelFileDescriptor?): Boolean {
+    fun startCoreLoop(vpnInterface: ParcelFileDescriptor?, onCoreStarted: (() -> Unit)? = null): Boolean {
         if (coreController.isRunning) {
             return false
+        }
+        if (startLoopJob?.isActive == true) {
+            return true
         }
 
         val service = getService() ?: return false
         val guid = MmkvManager.getSelectServer() ?: return false
         val config = MmkvManager.decodeServerConfig(guid) ?: return false
-        val result = V2rayConfigManager.getV2rayConfig(service, guid)
-        if (!result.status)
-            return false
 
         try {
             val mFilter = IntentFilter(AppConfig.BROADCAST_ACTION_SERVICE)
@@ -153,36 +242,164 @@ object V2RayServiceManager {
             return false
         }
 
-        currentConfig = config
+        val selectedConfig = config
+        currentConfig = selectedConfig
         var tunFd = vpnInterface?.fd ?: 0
         if (SettingsManager.isUsingHevTun()) {
             tunFd = 0
         }
 
         try {
-            NotificationManager.showNotification(currentConfig)
-            coreController.startLoop(result.content, tunFd)
+            NotificationManager.showNotification(selectedConfig)
         } catch (e: Exception) {
             Log.e(AppConfig.TAG, "Failed to start Core loop", e)
             return false
         }
 
-        if (coreController.isRunning == false) {
-            MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_START_FAILURE, "")
-            NotificationManager.cancelNotification()
-            return false
-        }
+        val generation = startLoopGeneration.incrementAndGet()
+        startLoopJob?.cancel()
+        startLoopJob = CoroutineScope(Dispatchers.Default).launch {
+            var shouldStopServiceOnFailure = true
+            try {
+                val result = V2rayConfigManager.getV2rayConfig(service, guid)
+                if (!result.status) {
+                    Log.e(AppConfig.TAG, "Failed to generate V2Ray config for startup")
+                    if (generation == startLoopGeneration.get()) {
+                        MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_START_FAILURE, "")
+                        NotificationManager.cancelNotification()
+                    }
+                    return@launch
+                }
 
-        try {
-            MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_START_SUCCESS, "")
-            //NotificationManager.showNotification(currentConfig)
-            NotificationManager.startSpeedNotification(currentConfig)
+                coreController.startLoop(result.content, tunFd)
+                if (!isActive || generation != startLoopGeneration.get()) {
+                    shouldStopServiceOnFailure = false
+                    return@launch
+                }
 
-        } catch (e: Exception) {
-            Log.e(AppConfig.TAG, "Failed to startup service", e)
-            return false
+                if (coreController.isRunning == false) {
+                    if (generation == startLoopGeneration.get()) {
+                        MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_START_FAILURE, "")
+                        NotificationManager.cancelNotification()
+                    }
+                    return@launch
+                }
+
+                runCatching {
+                    onCoreStarted?.invoke()
+                }.onFailure { e ->
+                    Log.e(AppConfig.TAG, "Failed to run post-core-start callback", e)
+                }
+
+                if (!waitForTrafficReady()) {
+                    Log.e(AppConfig.TAG, "Traffic probe failed after core startup")
+                    if (generation == startLoopGeneration.get()) {
+                        MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_START_FAILURE, "")
+                        NotificationManager.cancelNotification()
+                    }
+                    return@launch
+                }
+
+                MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_START_SUCCESS, "")
+                NotificationManager.startSpeedNotification(selectedConfig)
+                shouldStopServiceOnFailure = false
+            } catch (e: Exception) {
+                Log.e(AppConfig.TAG, "Failed to start Core loop", e)
+                if (generation == startLoopGeneration.get()) {
+                    MessageUtil.sendMsg2UI(service, AppConfig.MSG_STATE_START_FAILURE, "")
+                    NotificationManager.cancelNotification()
+                }
+            } finally {
+                if (generation == startLoopGeneration.get()) {
+                    startLoopJob = null
+                }
+                if (shouldStopServiceOnFailure && generation == startLoopGeneration.get()) {
+                    runCatching {
+                        serviceControl?.get()?.stopService()
+                    }.onFailure { err ->
+                        Log.e(AppConfig.TAG, "Failed to stop service after startup failure", err)
+                    }
+                }
+            }
         }
         return true
+    }
+
+    private suspend fun waitForTrafficReady(): Boolean {
+        if (!coreController.isRunning) {
+            return false
+        }
+
+        val probeUrls = LinkedHashSet<String>()
+        probeUrls.add(SettingsManager.getDelayTestUrl())
+        probeUrls.add(SettingsManager.getDelayTestUrl(true))
+        probeUrls.add(TRAFFIC_READY_EXTRA_PROBE_URL)
+
+        val urls = probeUrls
+            .map { it.trim() }
+            .filter { it.startsWith("http://") || it.startsWith("https://") }
+        if (urls.isEmpty()) {
+            return true
+        }
+
+        val socksPort = SettingsManager.getSocksPort()
+        if (socksPort <= 0) {
+            return false
+        }
+
+        repeat(TRAFFIC_READY_ATTEMPTS) { attempt ->
+            val ready = coroutineScope {
+                val pending = mutableListOf<Deferred<Boolean>>()
+                urls.forEach { url ->
+                    pending.add(
+                        async(Dispatchers.IO) {
+                            probeTrafficViaSocks(url, socksPort)
+                        }
+                    )
+                }
+                while (pending.isNotEmpty()) {
+                    val (finished, value) = select<Pair<Deferred<Boolean>, Boolean>> {
+                        pending.forEach { d ->
+                            d.onAwait { result -> d to result }
+                        }
+                    }
+                    pending.remove(finished)
+                    if (value) {
+                        pending.forEach { it.cancel() }
+                        return@coroutineScope true
+                    }
+                }
+                false
+            }
+            if (ready) {
+                return true
+            }
+            if (attempt < TRAFFIC_READY_ATTEMPTS - 1) {
+                delay(TRAFFIC_READY_RETRY_DELAY_MS)
+            }
+        }
+
+        return false
+    }
+
+    private fun probeTrafficViaSocks(url: String, socksPort: Int): Boolean {
+        var conn: HttpURLConnection? = null
+        return try {
+            val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress(AppConfig.LOOPBACK, socksPort))
+            conn = (URL(url).openConnection(proxy) as? HttpURLConnection) ?: return false
+            conn.connectTimeout = TRAFFIC_READY_CONNECT_TIMEOUT_MS
+            conn.readTimeout = TRAFFIC_READY_READ_TIMEOUT_MS
+            conn.instanceFollowRedirects = false
+            conn.useCaches = false
+            conn.setRequestProperty("Connection", "close")
+            conn.connect()
+            val responseCode = conn.responseCode
+            responseCode in 200..399
+        } catch (_: Exception) {
+            false
+        } finally {
+            conn?.disconnect()
+        }
     }
 
     /**
@@ -193,6 +410,7 @@ object V2RayServiceManager {
     fun stopCoreLoop(): Boolean {
         val service = getService() ?: return false
         cancelDelayMeasure()
+        cancelPendingStartLoop()
 
         if (coreController.isRunning) {
             CoroutineScope(Dispatchers.IO).launch {
@@ -244,8 +462,10 @@ object V2RayServiceManager {
         delayMeasureJob?.cancel()
         delayMeasureJob = CoroutineScope(Dispatchers.IO).launch {
             val service = getService() ?: return@launch
-            // Use applicationContext for correct app-configured locale
-            val ctx = service.applicationContext
+            val ctx = MyContextWrapper.wrap(
+                service.applicationContext,
+                SettingsManager.getLocale()
+            )
             var details: String? = null
 
             fun isCurrentRequestActive(): Boolean {
@@ -420,14 +640,13 @@ object V2RayServiceManager {
 
                 AppConfig.MSG_STATE_STOP -> {
                     Log.i(AppConfig.TAG, "Stop Service")
+                    cancelPendingRestart()
                     serviceControl.stopService()
                 }
 
                 AppConfig.MSG_STATE_RESTART -> {
                     Log.i(AppConfig.TAG, "Restart Service")
-                    serviceControl.stopService()
-                    Thread.sleep(500L)
-                    startVService(serviceControl.getService())
+                    restartCoreLoopAsync(serviceControl)
                 }
 
                 AppConfig.MSG_MEASURE_DELAY -> {

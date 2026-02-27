@@ -282,6 +282,9 @@
     <string name="title_logcat">Logcat</string>
     <string name="logcat_copy">Copy</string>
     <string name="logcat_clear">Clear</string>
+    <string name="title_quick_switch_mode">Quick switch mode</string>
+    <string name="title_switch_to_vpn_mode">Switch to VPN mode</string>
+    <string name="title_switch_to_proxy_mode">Switch to Proxy mode</string>
     <string name="title_service_restart">Service restart</string>
     <string name="title_del_all_config">Delete config</string>
     <string name="title_del_duplicate_config">Delete duplicate config</string>
@@ -301,6 +304,12 @@
     <string name="title_sub_update">Update subscription</string>
     <string name="title_ping_all_server">Tcping config</string>
     <string name="title_real_ping_all_server">Real delay config</string>
+    <string name="title_check_ips_working_scope">Check IP A/B (working scope)</string>
+    <string name="ip_check_scope_count">Checking IP A/B for %d servers</string>
+    <string name="ip_check_no_working_server_scope">No working servers in current scope</string>
+    <string name="ip_check_progress">IP check %1$d/%2$d</string>
+    <string name="ip_check_done">IP check done: %d servers</string>
+    <string name="ip_check_unavailable">unavailable</string>
     <string name="title_user_asset_setting">Asset files</string>
     <string name="title_sort_by_test_results">Sorting by test results</string>
     <string name="title_filter_config">Filter config</string>

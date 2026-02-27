@@ -17,19 +17,56 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.selects.select
 import java.io.IOException
+import java.net.Inet6Address
+import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.UnknownHostException
+import java.util.concurrent.ConcurrentHashMap
 
 object SpeedtestManager {
 
-    private const val PARALLEL_CHECK_ATTEMPTS = 3
-    private const val IP_CHECK_TIMEOUT_MS = 5000
-    private const val GEO_CHECK_TIMEOUT_MS = 7000
+    private const val IP_CHECK_PARALLEL_ATTEMPTS = 2
+    private const val WHO_CHECK_PARALLEL_ATTEMPTS = 1
+    private const val IP_CHECK_TIMEOUT_MS = 2500
+    private const val GEO_CHECK_TIMEOUT_MS = 3500
+    private const val FAST_IP_CHECK_PARALLEL_ATTEMPTS = 1
+    private const val FAST_WHO_CHECK_PARALLEL_ATTEMPTS = 1
+    private const val FAST_IP_CHECK_TIMEOUT_MS = 1200
+    private const val FAST_GEO_CHECK_TIMEOUT_MS = 1600
+    private const val WHO_SUMMARY_CACHE_TTL_MS = 2 * 60 * 1000L
+    private const val WHO_SUMMARY_CACHE_MAX_ENTRIES = 1024
     private val IPV4_REGEX =
         Regex("^([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])\\.([01]?[0-9]?[0-9]|2[0-4][0-9]|25[0-5])$")
 
     private val tcpTestingSockets = ArrayList<Socket?>()
+    private val whoSummaryCache = ConcurrentHashMap<String, CachedWhoSummary>()
+
+    private data class IpGeoLookupConfig(
+        val ipParallelAttempts: Int,
+        val whoParallelAttempts: Int,
+        val ipTimeoutMs: Int,
+        val geoTimeoutMs: Int
+    )
+
+    private val defaultLookupConfig = IpGeoLookupConfig(
+        ipParallelAttempts = IP_CHECK_PARALLEL_ATTEMPTS,
+        whoParallelAttempts = WHO_CHECK_PARALLEL_ATTEMPTS,
+        ipTimeoutMs = IP_CHECK_TIMEOUT_MS,
+        geoTimeoutMs = GEO_CHECK_TIMEOUT_MS
+    )
+
+    private val fastLookupConfig = IpGeoLookupConfig(
+        ipParallelAttempts = FAST_IP_CHECK_PARALLEL_ATTEMPTS,
+        whoParallelAttempts = FAST_WHO_CHECK_PARALLEL_ATTEMPTS,
+        ipTimeoutMs = FAST_IP_CHECK_TIMEOUT_MS,
+        geoTimeoutMs = FAST_GEO_CHECK_TIMEOUT_MS
+    )
+
+    private data class CachedWhoSummary(
+        val summary: String,
+        val cachedAtMs: Long
+    )
 
     /**
      * Measures the TCP connection time to a given URL and port.
@@ -171,26 +208,30 @@ object SpeedtestManager {
      * Performs multi-source IP lookups and then resolves each discovered IP with:
      * https://i.idanya.ru/who/$IP
      *
-     * For each source (A/B), 3 parallel requests are fired and the first valid result wins.
-     * Then 3 parallel Geo lookups are fired for that IP and the first valid result wins.
+     * For each source (A/B), several parallel requests are fired and the first valid result wins.
+     * Geo lookups use i.idanya.ru/who/$IP.
      */
-    suspend fun getRemoteIpAndGeoInfoSummary(
-        onPartialUpdate: ((String) -> Unit)? = null,
-        httpPortOverride: Int? = null
-    ): String? = coroutineScope {
+    suspend fun getRemoteIpAndGeoInfoBySource(
+        httpPortOverride: Int? = null,
+        onPartialUpdate: ((Map<String, String>) -> Unit)? = null,
+        fastMode: Boolean = false
+    ): Map<String, String> = coroutineScope {
         val httpPort = httpPortOverride ?: SettingsManager.getHttpPort()
+        val lookupConfig = if (fastMode) fastLookupConfig else defaultLookupConfig
 
         val pending = mutableListOf(
             async(Dispatchers.IO) {
                 "A" to resolveIpGeoSummary(
-                    ipCheckUrl = SettingsManager.getIpCheckUrlA(),
-                    httpPort = httpPort
+                    ipCheckUrl = AppConfig.IP_CHECK_A_URL,
+                    httpPort = httpPort,
+                    lookupConfig = lookupConfig
                 )
             },
             async(Dispatchers.IO) {
                 "B" to resolveIpGeoSummary(
-                    ipCheckUrl = SettingsManager.getIpCheckUrlB(),
-                    httpPort = httpPort
+                    ipCheckUrl = AppConfig.IP_CHECK_B_URL,
+                    httpPort = httpPort,
+                    lookupConfig = lookupConfig
                 )
             }
         )
@@ -204,40 +245,136 @@ object SpeedtestManager {
             }
             pending.remove(finished)
             resolved[result.first] = result.second
-            buildIpGeoSummaryLines(resolved)?.let { onPartialUpdate?.invoke(it) }
+            onPartialUpdate?.invoke(LinkedHashMap(resolved))
         }
 
-        buildIpGeoSummaryLines(resolved)
+        LinkedHashMap(resolved)
     }
 
-    private suspend fun resolveIpGeoSummary(ipCheckUrl: String, httpPort: Int): String {
-        val ip = firstNonNull(PARALLEL_CHECK_ATTEMPTS) {
-            extractFirstIp(HttpUtil.getUrlContent(ipCheckUrl, IP_CHECK_TIMEOUT_MS, httpPort))
-        } ?: return "unavailable"
+    /**
+     * Resolves raw remote IPs from source A/B without Geo enrichment.
+     */
+    suspend fun getRemoteIpBySource(
+        httpPortOverride: Int? = null,
+        onPartialUpdate: ((Map<String, String>) -> Unit)? = null
+    ): Map<String, String> = coroutineScope {
+        val httpPort = httpPortOverride ?: SettingsManager.getHttpPort()
+        val lookupConfig = defaultLookupConfig
 
-        val whoUrl = "https://i.idanya.ru/who/${Utils.urlEncode(ip)}"
-        val whoSummary = firstNonNull(PARALLEL_CHECK_ATTEMPTS) {
-            summarizeGeoBody(HttpUtil.getUrlContent(whoUrl, GEO_CHECK_TIMEOUT_MS, httpPort))
-                ?.takeIf { it.isNotBlank() }
+        val pending = mutableListOf(
+            async(Dispatchers.IO) {
+                val ip = resolveRemoteIp(
+                    ipCheckUrl = AppConfig.IP_CHECK_A_URL,
+                    httpPort = httpPort,
+                    lookupConfig = lookupConfig
+                )
+                "A" to ip
+            },
+            async(Dispatchers.IO) {
+                val ip = resolveRemoteIp(
+                    ipCheckUrl = AppConfig.IP_CHECK_B_URL,
+                    httpPort = httpPort,
+                    lookupConfig = lookupConfig
+                )
+                "B" to ip
+            }
+        )
+        val resolved = linkedMapOf<String, String>()
+
+        while (pending.isNotEmpty()) {
+            val (finished, result) = select<Pair<Deferred<Pair<String, String?>>, Pair<String, String?>>> {
+                pending.forEach { task ->
+                    task.onAwait { value -> task to value }
+                }
+            }
+            pending.remove(finished)
+            result.second?.let { resolved[result.first] = it }
+            onPartialUpdate?.invoke(LinkedHashMap(resolved))
         }
-        return whoSummary ?: ip
+
+        LinkedHashMap(resolved)
     }
 
-    private suspend fun <T> firstNonNull(attempts: Int, task: suspend () -> T?): T? = coroutineScope {
-        if (attempts <= 0) {
+    /**
+     * Builds user-facing summary lines from IP source A/B checks.
+     */
+    suspend fun getRemoteIpAndGeoInfoSummary(
+        onPartialUpdate: ((String) -> Unit)? = null,
+        httpPortOverride: Int? = null
+    ): String? {
+        val resolved = getRemoteIpAndGeoInfoBySource(
+            httpPortOverride = httpPortOverride,
+            onPartialUpdate = { partial ->
+                buildIpGeoSummaryLines(partial)?.let { onPartialUpdate?.invoke(it) }
+            }
+        )
+        return buildIpGeoSummaryLines(resolved)
+    }
+
+    private suspend fun resolveIpGeoSummary(
+        ipCheckUrl: String,
+        httpPort: Int,
+        lookupConfig: IpGeoLookupConfig
+    ): String {
+        val ip = resolveRemoteIp(
+            ipCheckUrl = ipCheckUrl,
+            httpPort = httpPort,
+            lookupConfig = lookupConfig
+        ) ?: return "unavailable"
+
+        getCachedWhoSummary(ip)?.let { cached ->
+            return cached
+        }
+
+        val whoUrl = AppConfig.GEOIP_CHECK_URL.replace("\$IP", Utils.urlEncode(ip))
+        val whoTasks = List(lookupConfig.whoParallelAttempts.coerceAtLeast(1)) {
+            suspend {
+                extractWhoLine(HttpUtil.getUrlContent(whoUrl, lookupConfig.geoTimeoutMs, httpPort))
+                    ?.takeIf { it.isNotBlank() }
+            }
+        }
+        val whoSummary = firstNonNullTasks(whoTasks)
+        val resolved = whoSummary ?: ip
+        if (!resolved.equals("unavailable", ignoreCase = true)) {
+            cacheWhoSummary(ip, resolved)
+        }
+        return resolved
+    }
+
+    private suspend fun resolveRemoteIp(
+        ipCheckUrl: String,
+        httpPort: Int,
+        lookupConfig: IpGeoLookupConfig
+    ): String? {
+        val tasks = List(lookupConfig.ipParallelAttempts.coerceAtLeast(1)) {
+            suspend {
+                extractFirstIp(
+                    HttpUtil.getUrlContent(
+                        url = ipCheckUrl,
+                        timeout = lookupConfig.ipTimeoutMs,
+                        httpPort = httpPort
+                    )
+                )
+            }
+        }
+        return firstNonNullTasks(tasks)
+    }
+
+    private suspend fun <T> firstNonNullTasks(tasks: List<suspend () -> T?>): T? = coroutineScope {
+        if (tasks.isEmpty()) {
             return@coroutineScope null
         }
 
-        val pending = MutableList(attempts) {
+        val pending = tasks.map { task ->
             async(Dispatchers.IO) {
                 try {
                     task()
                 } catch (e: Exception) {
-                    Log.w(AppConfig.TAG, "Parallel check attempt failed", e)
+                    Log.w(AppConfig.TAG, "Parallel check task failed", e)
                     null
                 }
             }
-        }
+        }.toMutableList()
 
         try {
             while (pending.isNotEmpty()) {
@@ -259,7 +396,7 @@ object SpeedtestManager {
 
     private fun buildIpGeoSummaryLines(resolved: Map<String, String>): String? {
         val lines = listOf("A", "B").mapNotNull { label ->
-            resolved[label]?.let { "IP $label: $it" }
+            resolved[label]?.trim()?.takeIf { it.isNotEmpty() }
         }
         return lines.takeIf { it.isNotEmpty() }?.joinToString("\n")
     }
@@ -268,68 +405,97 @@ object SpeedtestManager {
         if (body.isNullOrBlank()) return null
 
         val trimmed = body.trim()
-        if (isIpv4Address(trimmed)) {
-            return trimmed
+        normalizeIpCandidate(trimmed)?.let { candidate ->
+            if (isIpAddress(candidate)) {
+                return candidate
+            }
         }
 
-        val candidateRegex = Regex("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b")
-        return candidateRegex.findAll(trimmed)
-            .map { it.value.trim('[', ']', '(', ')', '{', '}', '<', '>', ',', ';', '"', '\'') }
+        val ipv4Regex = Regex("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b")
+        ipv4Regex.findAll(trimmed)
+            .mapNotNull { normalizeIpCandidate(it.value) }
             .firstOrNull { token -> token.isNotEmpty() && isIpv4Address(token) }
+            ?.let { return it }
+
+        val tokenRegex = Regex("[\\s,;\"'<>\\[\\]\\(\\){}]+")
+        return trimmed
+            .split(tokenRegex)
+            .asSequence()
+            .mapNotNull { normalizeIpCandidate(it) }
+            .firstOrNull { token -> token.isNotEmpty() && isIpAddress(token) }
+    }
+
+    private fun extractWhoLine(body: String?): String? {
+        if (body.isNullOrBlank()) return null
+        val normalized = stripAnsi(body)
+            .replace("\r\n", "\n")
+            .replace('\r', '\n')
+            .trim()
+        if (normalized.isBlank()) return null
+        val firstLine = normalized
+            .lineSequence()
+            .map { it.trimEnd() }
+            .firstOrNull { it.isNotBlank() }
+            ?: normalized
+        return firstLine
+            .replace(Regex("^[^\\p{L}\\p{N}(\\[]+"), "")
+            .trim()
+            .ifEmpty { firstLine.trim() }
+    }
+
+    private fun normalizeIpCandidate(value: String?): String? {
+        if (value.isNullOrBlank()) return null
+        val cleaned = value.trim()
+            .trim('[', ']', '(', ')', '{', '}', '<', '>', ',', ';', '"', '\'')
+            .removeSuffix(".")
+            .takeIf { it.isNotEmpty() }
+            ?: return null
+
+        // Handle common IPv4 host:port format.
+        if (cleaned.count { it == ':' } == 1 && cleaned.contains('.')) {
+            val port = cleaned.substringAfterLast(':')
+            if (port.all { it.isDigit() }) {
+                return cleaned.substringBeforeLast(':')
+            }
+        }
+
+        return cleaned
+    }
+
+    private fun isIpAddress(value: String): Boolean {
+        return isIpv4Address(value) || isIpv6Address(value)
     }
 
     private fun isIpv4Address(value: String): Boolean {
         return IPV4_REGEX.matches(value)
     }
 
-    private fun summarizeGeoBody(body: String?): String? {
-        if (body.isNullOrBlank()) return null
-        val trimmed = stripAnsi(body).trim()
+    private fun isIpv6Address(value: String): Boolean {
+        if (!value.contains(':')) return false
+        val normalized = value.substringBefore('%')
+        return runCatching {
+            InetAddress.getByName(normalized) is Inet6Address
+        }.getOrDefault(false)
+    }
 
-        parseIpApiInfo(trimmed)?.let { info ->
-            val country = listOf(
-                info.country_name,
-                info.country,
-                info.country_code,
-                info.countryCode,
-                info.location?.country_code
-            ).firstOrNull { !it.isNullOrBlank() }
-            val ip = listOf(
-                info.ip,
-                info.clientIp,
-                info.ip_addr,
-                info.query
-            ).firstOrNull { !it.isNullOrBlank() }
-            if (!country.isNullOrBlank() || !ip.isNullOrBlank()) {
-                return listOf(country, ip)
-                    .filter { !it.isNullOrBlank() }
-                    .joinToString(" ")
-                    .take(120)
-            }
+    private fun getCachedWhoSummary(ip: String): String? {
+        val entry = whoSummaryCache[ip] ?: return null
+        val now = SystemClock.elapsedRealtime()
+        if (now - entry.cachedAtMs > WHO_SUMMARY_CACHE_TTL_MS) {
+            whoSummaryCache.remove(ip, entry)
+            return null
         }
+        return entry.summary
+    }
 
-        JsonUtil.parseString(trimmed)?.let { json ->
-            val country = json.get("country")?.takeIf { !it.isJsonNull }?.asString
-            val region = json.get("region")?.takeIf { !it.isJsonNull }?.asString
-            val city = json.get("city")?.takeIf { !it.isJsonNull }?.asString
-            val ip = json.get("query")?.takeIf { !it.isJsonNull }?.asString
-            val summary = listOf(country, region, city, ip)
-                .filter { !it.isNullOrBlank() }
-                .joinToString(" ")
-                .replace(Regex("\\s+"), " ")
-                .trim()
-            if (summary.isNotEmpty()) {
-                return summary.take(120)
-            }
+    private fun cacheWhoSummary(ip: String, summary: String) {
+        if (whoSummaryCache.size >= WHO_SUMMARY_CACHE_MAX_ENTRIES) {
+            whoSummaryCache.clear()
         }
-
-        return trimmed
-            .lineSequence()
-            .map { it.trim() }
-            .firstOrNull { it.isNotEmpty() }
-            ?.replace(Regex("<[^>]+>"), " ")
-            ?.replace(Regex("\\s+"), " ")
-            ?.take(120)
+        whoSummaryCache[ip] = CachedWhoSummary(
+            summary = summary,
+            cachedAtMs = SystemClock.elapsedRealtime()
+        )
     }
 
     private fun stripAnsi(value: String): String {

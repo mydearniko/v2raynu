@@ -31,13 +31,15 @@ import java.util.concurrent.ConcurrentHashMap
 object V2rayConfigManager {
     private var initConfigCache: String? = null
     private var initConfigCacheWithTun: String? = null
-    private const val LARGE_RUNTIME_CONFIG_OUTBOUND_THRESHOLD = 128
+    private const val RUNTIME_CONFIG_CACHE_MAX_ENTRIES = 8
     private const val DNS_PRERESOLVE_OUTBOUND_LIMIT = 64
     private const val DNS_PRERESOLVE_LOOKUP_LIMIT = 2
     private const val DNS_PRERESOLVE_DISABLE_LOOKUP_OUTBOUND_LIMIT = 256
+    private const val DNS_PRERESOLVE_STARTUP_LOOKUP_LIMIT = 0
     private const val DNS_CACHE_TTL_MS = 5 * 60 * 1000L
     private const val DNS_CACHE_MAX_ENTRIES = 4096
     private val dnsResolveCache = ConcurrentHashMap<String, CachedDnsResult>()
+    private val runtimeConfigCache = ConcurrentHashMap<String, String>()
     private val tcpHttpHeaderUserAgent = listOf(
         "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.122 Mobile Safari/537.36"
     )
@@ -61,6 +63,27 @@ object V2rayConfigManager {
         val ipv6Enabled: Boolean
     )
 
+    private fun runtimeConfigCacheKey(guid: String): String {
+        val revision = MmkvManager.getRuntimeConfigRevision()
+        val mode = if (SettingsManager.isVpnMode()) "vpn" else "proxy"
+        val tun = if (SettingsManager.isUsingHevTun()) "hev" else "xraytun"
+        return "$guid|$revision|$mode|$tun"
+    }
+
+    private fun getCachedRuntimeConfig(guid: String): ConfigResult? {
+        val key = runtimeConfigCacheKey(guid)
+        val cached = runtimeConfigCache[key] ?: return null
+        return ConfigResult(true, guid, cached)
+    }
+
+    private fun putCachedRuntimeConfig(guid: String, content: String) {
+        if (content.isBlank()) return
+        if (runtimeConfigCache.size >= RUNTIME_CONFIG_CACHE_MAX_ENTRIES) {
+            runtimeConfigCache.clear()
+        }
+        runtimeConfigCache[runtimeConfigCacheKey(guid)] = content
+    }
+
     //region get config function
 
     /**
@@ -71,6 +94,25 @@ object V2rayConfigManager {
      * @return A ConfigResult object containing the configuration details or indicating failure.
      */
     fun getV2rayConfig(context: Context, guid: String): ConfigResult {
+        getCachedRuntimeConfig(guid)?.let { return it }
+        val result = buildV2rayConfig(context, guid)
+        if (result.status && result.content.isNotBlank()) {
+            putCachedRuntimeConfig(guid, result.content)
+        }
+        return result
+    }
+
+    /**
+     * Best-effort config warmup for reducing service startup latency.
+     */
+    fun warmupV2rayConfig(context: Context, guid: String) {
+        if (guid.isBlank()) return
+        runCatching {
+            getV2rayConfig(context, guid)
+        }
+    }
+
+    private fun buildV2rayConfig(context: Context, guid: String): ConfigResult {
         try {
             val config = MmkvManager.decodeServerConfig(guid) ?: return ConfigResult(false)
             return if (config.configType == EConfigType.CUSTOM) {
@@ -385,12 +427,7 @@ object V2rayConfigManager {
     }
 
     private fun serializeRuntimeConfig(v2rayConfig: V2rayConfig, preferCompact: Boolean = false): String {
-        val useCompact = preferCompact || v2rayConfig.outbounds.size >= LARGE_RUNTIME_CONFIG_OUTBOUND_THRESHOLD
-        return if (useCompact) {
-            JsonUtil.toJsonCoreSafe(v2rayConfig) ?: ""
-        } else {
-            JsonUtil.toJsonPretty(v2rayConfig) ?: ""
-        }
+        return JsonUtil.toJsonCoreSafe(v2rayConfig) ?: ""
     }
 
 
@@ -1128,13 +1165,16 @@ object V2rayConfigManager {
         val newHosts = dns.hosts?.toMutableMap() ?: mutableMapOf()
         val preferIpv6 = SettingsManager.isIpv6Enabled()
         val ipv4Only = SettingsManager.isIpv6Disabled()
-        val lookupBudget = when {
+        val blockingLookupBudget = when {
             // Large policy groups can contain thousands of outbounds. Synchronous DNS
             // pre-resolve here would block service startup for several seconds.
             proxyOutboundList.size > DNS_PRERESOLVE_DISABLE_LOOKUP_OUTBOUND_LIMIT -> 0
             proxyOutboundList.size > DNS_PRERESOLVE_OUTBOUND_LIMIT -> DNS_PRERESOLVE_LOOKUP_LIMIT
             else -> Int.MAX_VALUE
         }
+        // Keep startup near-instant: only use cached DNS here and avoid live lookups
+        // on the critical path. xray-core will resolve domains at runtime.
+        val lookupBudget = minOf(blockingLookupBudget, DNS_PRERESOLVE_STARTUP_LOOKUP_LIMIT)
         var lookupCount = 0
 
         for (item in proxyOutboundList) {

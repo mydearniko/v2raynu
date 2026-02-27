@@ -207,6 +207,42 @@
 
             </LinearLayout>
 
+            <TextView
+                android:id="@+id/tv_ip_check_a"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:fontFamily="@font/hack_nerd_font_regular"
+                android:includeFontPadding="false"
+                android:maxLines="1"
+                android:paddingStart="@dimen/padding_spacing_dp8"
+                android:paddingTop="2dp"
+                android:paddingEnd="@dimen/padding_spacing_dp8"
+                android:singleLine="true"
+                android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                android:textColor="@color/colorConfigType"
+                android:textSize="9sp"
+                android:visibility="gone"
+                tools:text="EU-RU MTS AS8359 203.0.113.10" />
+
+            <TextView
+                android:id="@+id/tv_ip_check_b"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:fontFamily="@font/hack_nerd_font_regular"
+                android:includeFontPadding="false"
+                android:maxLines="1"
+                android:paddingStart="@dimen/padding_spacing_dp8"
+                android:paddingTop="1dp"
+                android:paddingEnd="@dimen/padding_spacing_dp8"
+                android:singleLine="true"
+                android:textAppearance="@style/TextAppearance.AppCompat.Small"
+                android:textColor="@color/colorConfigType"
+                android:textSize="9sp"
+                android:visibility="gone"
+                tools:text="US-CA Cloudflare AS13335 198.51.100.20" />
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"

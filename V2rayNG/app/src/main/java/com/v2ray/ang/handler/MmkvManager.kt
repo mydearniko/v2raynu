@@ -14,6 +14,7 @@ import com.v2ray.ang.dto.WebDavConfig
 import com.v2ray.ang.util.JsonUtil
 import com.v2ray.ang.util.Utils
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 object MmkvManager {
 
@@ -42,8 +43,17 @@ object MmkvManager {
     private val settingsStorage by lazy { MMKV.mmkvWithID(ID_SETTING, MMKV.MULTI_PROCESS_MODE) }
     private val serverConfigCache = ConcurrentHashMap<String, ProfileItem>()
     private val serverListCacheLock = Any()
+    private val runtimeConfigRevision = AtomicLong(1L)
     @Volatile
     private var serverListCache: MutableList<String>? = null
+
+    private fun bumpRuntimeConfigRevision() {
+        runtimeConfigRevision.incrementAndGet()
+    }
+
+    fun getRuntimeConfigRevision(): Long {
+        return runtimeConfigRevision.get()
+    }
 
     //endregion
 
@@ -213,6 +223,7 @@ object MmkvManager {
 //            serverPort = config.getProxyOutbound()?.getServerPort(),
 //        )
 //        profileStorage.encode(key, JsonUtil.toJson(profile))
+        bumpRuntimeConfigRevision()
         return key
     }
 
@@ -235,6 +246,7 @@ object MmkvManager {
         serverConfigCache.remove(guid)
         //profileStorage.remove(guid)
         serverAffStorage.remove(guid)
+        bumpRuntimeConfigRevision()
     }
 
     /**
@@ -268,6 +280,9 @@ object MmkvManager {
             profileFullStorage.remove(guid)
             serverConfigCache.remove(guid)
             serverAffStorage.remove(guid)
+        }
+        if (before != serverList.size) {
+            bumpRuntimeConfigRevision()
         }
         return before - serverList.size
     }
@@ -320,6 +335,9 @@ object MmkvManager {
             mainStorage.encode(KEY_SELECTED_SERVER, keys.first())
         }
 
+        if (keys.isNotEmpty()) {
+            bumpRuntimeConfigRevision()
+        }
         return keys
     }
 
@@ -382,8 +400,21 @@ object MmkvManager {
             .toMutableList()
 
         val valid = aff.testDelaySamples.filter { it >= 0L }.sorted()
-        // Treat less than 2 successful samples as unstable to reduce false positives.
-        aff.testDelayMillis = if (valid.size >= 2) valid[valid.size / 2] else -1L
+        // Any successful sample means the server is reachable; keep failures only when all probes fail.
+        aff.testDelayMillis = if (valid.isNotEmpty()) valid[valid.size / 2] else -1L
+        serverAffStorage.encode(guid, JsonUtil.toJson(aff))
+    }
+
+    /**
+     * Encodes per-server IP check summaries (source A/B).
+     */
+    fun encodeServerIpCheckSummary(guid: String, ipA: String?, ipB: String?) {
+        if (guid.isBlank()) {
+            return
+        }
+        val aff = decodeServerAffiliationInfo(guid) ?: ServerAffiliationInfo()
+        aff.ipCheckA = ipA?.trim()?.takeIf { it.isNotEmpty() }
+        aff.ipCheckB = ipB?.trim()?.takeIf { it.isNotEmpty() }
         serverAffStorage.encode(guid, JsonUtil.toJson(aff))
     }
 
@@ -416,6 +447,9 @@ object MmkvManager {
         }
         //profileStorage.clearAll()
         serverAffStorage.clearAll()
+        if (count > 0) {
+            bumpRuntimeConfigRevision()
+        }
         return count
     }
 
@@ -455,6 +489,7 @@ object MmkvManager {
      */
     fun encodeServerRaw(guid: String, config: String) {
         serverRawStorage.encode(guid, config)
+        bumpRuntimeConfigRevision()
     }
 
     /**
@@ -659,7 +694,11 @@ object MmkvManager {
      * @return Whether the encoding was successful.
      */
     fun encodeSettings(key: String, value: String?): Boolean {
-        return settingsStorage.encode(key, value)
+        val ret = settingsStorage.encode(key, value)
+        if (ret) {
+            bumpRuntimeConfigRevision()
+        }
+        return ret
     }
 
     /**
@@ -670,7 +709,11 @@ object MmkvManager {
      * @return Whether the encoding was successful.
      */
     fun encodeSettings(key: String, value: Int): Boolean {
-        return settingsStorage.encode(key, value)
+        val ret = settingsStorage.encode(key, value)
+        if (ret) {
+            bumpRuntimeConfigRevision()
+        }
+        return ret
     }
 
     /**
@@ -681,7 +724,11 @@ object MmkvManager {
      * @return Whether the encoding was successful.
      */
     fun encodeSettings(key: String, value: Long): Boolean {
-        return settingsStorage.encode(key, value)
+        val ret = settingsStorage.encode(key, value)
+        if (ret) {
+            bumpRuntimeConfigRevision()
+        }
+        return ret
     }
 
     /**
@@ -692,7 +739,11 @@ object MmkvManager {
      * @return Whether the encoding was successful.
      */
     fun encodeSettings(key: String, value: Float): Boolean {
-        return settingsStorage.encode(key, value)
+        val ret = settingsStorage.encode(key, value)
+        if (ret) {
+            bumpRuntimeConfigRevision()
+        }
+        return ret
     }
 
     /**
@@ -703,7 +754,11 @@ object MmkvManager {
      * @return Whether the encoding was successful.
      */
     fun encodeSettings(key: String, value: Boolean): Boolean {
-        return settingsStorage.encode(key, value)
+        val ret = settingsStorage.encode(key, value)
+        if (ret) {
+            bumpRuntimeConfigRevision()
+        }
+        return ret
     }
 
     /**
@@ -714,7 +769,11 @@ object MmkvManager {
      * @return Whether the encoding was successful.
      */
     fun encodeSettings(key: String, value: MutableSet<String>): Boolean {
-        return settingsStorage.encode(key, value)
+        val ret = settingsStorage.encode(key, value)
+        if (ret) {
+            bumpRuntimeConfigRevision()
+        }
+        return ret
     }
 
     /**

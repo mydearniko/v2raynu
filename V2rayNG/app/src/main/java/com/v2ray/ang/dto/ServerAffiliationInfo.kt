@@ -2,7 +2,9 @@ package com.v2ray.ang.dto
 
 data class ServerAffiliationInfo(
     var testDelayMillis: Long = 0L,
-    var testDelaySamples: MutableList<Long> = mutableListOf()
+    var testDelaySamples: MutableList<Long> = mutableListOf(),
+    var ipCheckA: String? = null,
+    var ipCheckB: String? = null
 ) {
     fun getSortedTestDelaySamples(): List<Long> {
         return testDelaySamples.sortedWith { a, b ->

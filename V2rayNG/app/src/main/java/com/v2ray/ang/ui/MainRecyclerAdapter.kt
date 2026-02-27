@@ -34,6 +34,7 @@ class MainRecyclerAdapter(
         private const val VIEW_TYPE_FOOTER = 2
         private val CONTROL_OR_WHITESPACE_REGEX = Regex("[\\u0000-\\u001F\\u007F\\s]")
         private val CONTROL_REGEX = Regex("[\\u0000-\\u001F\\u007F]+")
+        private val MULTI_SPACE_REGEX = Regex("\\s+")
     }
 
     private val doubleColumnDisplay = MmkvManager.decodeSettingsBool(AppConfig.PREF_DOUBLE_COLUMN_DISPLAY, false)
@@ -90,6 +91,23 @@ class MainRecyclerAdapter(
                 } else {
                     holder.itemMainBinding.tvTestResult.setTextColor(ContextCompat.getColor(context, R.color.colorPing))
                 }
+            }
+
+            val lineA = sanitizeIpCheckLine(aff?.ipCheckA)
+            val lineB = sanitizeIpCheckLine(aff?.ipCheckB)
+            if (lineA.isNullOrEmpty()) {
+                holder.itemMainBinding.tvIpCheckA.visibility = View.GONE
+                holder.itemMainBinding.tvIpCheckA.text = ""
+            } else {
+                holder.itemMainBinding.tvIpCheckA.visibility = View.VISIBLE
+                holder.itemMainBinding.tvIpCheckA.text = lineA
+            }
+            if (lineB.isNullOrEmpty()) {
+                holder.itemMainBinding.tvIpCheckB.visibility = View.GONE
+                holder.itemMainBinding.tvIpCheckB.text = ""
+            } else {
+                holder.itemMainBinding.tvIpCheckB.visibility = View.VISIBLE
+                holder.itemMainBinding.tvIpCheckB.text = lineB
             }
 
             //layoutIndicator
@@ -232,6 +250,14 @@ class MainRecyclerAdapter(
             )
         }
         return builder
+    }
+
+    private fun sanitizeIpCheckLine(value: String?): String? {
+        return value
+            ?.replace(CONTROL_REGEX, " ")
+            ?.replace(MULTI_SPACE_REGEX, " ")
+            ?.trim()
+            ?.nullIfBlank()
     }
 
     fun removeServerSub(guid: String, position: Int) {

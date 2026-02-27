@@ -63,8 +63,8 @@
         </menu>
     </item>
     <item
-        android:id="@+id/service_restart"
-        android:title="@string/title_service_restart"
+        android:id="@+id/quick_switch_mode"
+        android:title="@string/title_quick_switch_mode"
         app:showAsAction="never" />
     <item
         android:id="@+id/del_all_config"
@@ -77,22 +77,16 @@
         android:title="@string/title_del_duplicate_config"
         app:showAsAction="never" />
     <item
-        android:id="@+id/del_invalid_config"
-        android:icon="@drawable/ic_delete_24dp"
-        android:title="@string/title_del_invalid_config"
-        app:showAsAction="never" />
-    <item
-        android:id="@+id/export_all"
-        android:icon="@drawable/ic_share_24dp"
-        android:title="@string/title_export_all"
-        app:showAsAction="never" />
-    <item
         android:id="@+id/ping_all"
         android:title="@string/title_ping_all_server"
         app:showAsAction="never" />
     <item
         android:id="@+id/real_ping_all"
         android:title="@string/title_real_ping_all_server"
+        app:showAsAction="never" />
+    <item
+        android:id="@+id/check_ips_working_scope"
+        android:title="@string/title_check_ips_working_scope"
         app:showAsAction="never" />
     <item
         android:id="@+id/sort_by_test_results"
